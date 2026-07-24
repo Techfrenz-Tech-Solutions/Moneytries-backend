@@ -45,6 +45,14 @@ async function ensureBalanceColumn() {
 // Run once on module load (non-blocking)
 ensureBalanceColumn();
 
+// ── Business rule: maximum single-transaction deposit amount ──────────────────
+// No single deposit may exceed ₹100,000 (1 Lakh). This is the authoritative,
+// always-enforced guard (applies to every existing and new database, unlike
+// the CHECK constraint in config/schema.sql which only applies to brand-new
+// installs — see the comment above that table definition for why).
+const MAX_DEPOSIT_AMOUNT = 100000;
+const MAX_AMOUNT_MESSAGE = 'The maximum allowed deposit or plan amount is ₹100,000.';
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fileUrl(storedPath) {
@@ -84,6 +92,9 @@ async function createDeposit(req, res) {
 
   if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
     return fail(res, 'Invalid amount.', 422);
+  }
+  if (Number(amount) > MAX_DEPOSIT_AMOUNT) {
+    return fail(res, MAX_AMOUNT_MESSAGE, 422);
   }
   if (!utr_id || String(utr_id).trim().length < 6) {
     return fail(res, 'Invalid UTR / Transaction ID.', 422);

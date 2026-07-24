@@ -139,6 +139,16 @@ CREATE TABLE IF NOT EXISTS kyc_submissions (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── deposits ─────────────────────────────────────────────────
+-- Business rule: a single deposit can never exceed ₹100,000 (1 Lakh).
+-- chk_deposit_amount_max enforces this at the database level for any
+-- brand-new install (fresh CREATE TABLE). It is intentionally NOT
+-- retro-applied via ALTER TABLE to already-existing `deposits` tables —
+-- doing so would validate every historical row and could fail startup
+-- if any legacy deposit already exceeds the new cap. The authoritative,
+-- always-applied guard for both new and existing databases is the
+-- application-level check in controllers/depositController.js
+-- (createDeposit), which runs before every INSERT regardless of
+-- whether this constraint is present.
 CREATE TABLE IF NOT EXISTS deposits (
   id               INT UNSIGNED    NOT NULL AUTO_INCREMENT,
   user_id          INT UNSIGNED    NOT NULL,
@@ -154,7 +164,8 @@ CREATE TABLE IF NOT EXISTS deposits (
   PRIMARY KEY (id),
   KEY idx_dep_user   (user_id),
   KEY idx_dep_status (order_status),
-  CONSTRAINT fk_dep_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  CONSTRAINT fk_dep_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+  CONSTRAINT chk_deposit_amount_max CHECK (amount <= 100000.00)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── withdrawals ──────────────────────────────────────────────

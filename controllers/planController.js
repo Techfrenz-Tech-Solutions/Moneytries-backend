@@ -17,6 +17,17 @@ const PLAN_MONTHS = {
   '12_month': 12,
 };
 
+// ── Business rule: maximum single-transaction investment amount ───────────────
+// No single investment plan's monthly amount may exceed ₹100,000 (1 Lakh).
+// This only gates the amount chosen when a NEW plan is first enrolled
+// (enrollPlan) — that monthly_amount is then fixed for every subsequent
+// instalment of that plan (payInstalment reuses plan.monthly_amount as-is,
+// it never accepts a new user-entered amount), so this single check is the
+// only place a user-supplied plan amount is ever written. Existing plans
+// already enrolled before this rule keep their original amount untouched.
+const MAX_PLAN_AMOUNT = 100000;
+const MAX_AMOUNT_MESSAGE = 'The maximum allowed deposit or plan amount is ₹100,000.';
+
 // Human-readable plan name used in ROI notification text, e.g. "3 Month Plan".
 function planDisplayName(planType) {
   const months = PLAN_MONTHS[planType];
@@ -50,6 +61,16 @@ async function ensureSchema() {
 }
 async function _runSchemaMigration() {
   try {
+    // Business rule: monthly_amount / instalment amount can never exceed
+    // ₹100,000 (1 Lakh). The CHECK constraints below only apply to a
+    // brand-new install's CREATE TABLE — like chk_deposit_amount_max in
+    // config/schema.sql, they are intentionally not retro-applied via
+    // ALTER TABLE to already-existing tables, since that would validate
+    // every historical row and could fail startup if a legacy plan
+    // already exceeds the new cap. The authoritative, always-enforced
+    // guard is the application-level check in enrollPlan() above, which
+    // runs before every INSERT regardless of whether this constraint
+    // exists on a given database.
     await db.execute(`
       CREATE TABLE IF NOT EXISTS investment_plans (
         id                INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -71,7 +92,8 @@ async function _runSchemaMigration() {
         updated_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         KEY idx_plan_user (user_id),
-        CONSTRAINT fk_plan_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        CONSTRAINT fk_plan_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        CONSTRAINT chk_plan_monthly_amount_max CHECK (monthly_amount <= 100000.00)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
 
@@ -100,7 +122,8 @@ async function _runSchemaMigration() {
         KEY idx_inst_plan (plan_id),
         KEY idx_inst_user (user_id),
         CONSTRAINT fk_inst_plan FOREIGN KEY (plan_id) REFERENCES investment_plans (id) ON DELETE CASCADE,
-        CONSTRAINT fk_inst_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        CONSTRAINT fk_inst_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        CONSTRAINT chk_instalment_amount_max CHECK (amount <= 100000.00)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
 
@@ -505,6 +528,7 @@ async function enrollPlan(req, res) {
 
   const amount = Number(monthly_amount);
   if (!amount || amount <= 0) return fail(res, 'Invalid monthly_amount.', 422);
+  if (amount > MAX_PLAN_AMOUNT) return fail(res, MAX_AMOUNT_MESSAGE, 422);
   if (!utr_id || utr_id.trim().length < 6) return fail(res, 'Invalid UTR ID.', 422);
 
   // ── KYC gate ─────────────────────────────────────────────────────────────
