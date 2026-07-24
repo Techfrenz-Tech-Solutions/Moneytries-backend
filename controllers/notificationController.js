@@ -1,6 +1,40 @@
 // controllers/notificationController.js
 const db = require('../config/db');
 const { ok, fail } = require('../utils/response');
+const { sendPushToUser } = require('../utils/pushService');
+
+// ── Push notification routing ────────────────────────────────────────────────
+// Maps a notification's `type` to the screen the Flutter app should open
+// when the user taps the push notification in the OS notification bar.
+// Keep in sync with AppRoutes in the frontend (lib/routes/app_routes.dart).
+const NOTIFICATION_ROUTE_MAP = {
+  deposit:    '/history',
+  withdrawal: '/history',
+  kyc:        '/kyc',
+  referral:   '/referral',
+  roi:        '/history',
+  plan:       '/plan',
+  system:     '/notifications',
+};
+
+/**
+ * Fires an FCM push for a notification row that was just inserted. Always
+ * fire-and-forget from the caller's perspective — a push failure (FCM not
+ * configured, network error, dead token, etc.) must never affect the
+ * already-committed notification row, which is the source of truth for the
+ * in-app Notification screen.
+ */
+function pushForNotification(userId, type, title, message, notificationId) {
+  sendPushToUser(userId, {
+    title,
+    body: message,
+    data: {
+      type,
+      notification_id: notificationId ?? '',
+      route: NOTIFICATION_ROUTE_MAP[type] || '/notifications',
+    },
+  }).catch(e => console.error('[notification] push send error:', e.message));
+}
 
 // ── Ensure notifications table exists ────────────────────────────────────────
 //
@@ -251,10 +285,11 @@ async function deleteNotification(req, res) {
 async function createNotification(userId, type, title, message) {
   try {
     await ensureNotificationsTable();
-    await db.execute(
+    const [result] = await db.execute(
       'INSERT INTO notifications (user_id, type, title, message) VALUES (?, ?, ?, ?)',
       [userId, type, title, message]
     );
+    pushForNotification(userId, type, title, message, result.insertId);
   } catch (err) {
     // Non-fatal — log and continue
     console.error('[notification] createNotification error:', err.message);
@@ -268,10 +303,11 @@ async function createNotification(userId, type, title, message) {
 async function createNotificationAt(userId, type, title, message, createdAt) {
   try {
     await ensureNotificationsTable();
-    await db.execute(
+    const [result] = await db.execute(
       'INSERT INTO notifications (user_id, type, title, message, created_at) VALUES (?, ?, ?, ?, ?)',
       [userId, type, title, message, createdAt]
     );
+    pushForNotification(userId, type, title, message, result.insertId);
   } catch (err) {
     // Non-fatal — log and continue
     console.error('[notification] createNotificationAt error:', err.message);

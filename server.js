@@ -21,6 +21,7 @@ const usersRoutes        = require('./routes/users');
 const adminUsersRoutes   = require('./routes/adminUsers');
 const dashboardRoutes    = require('./routes/dashboard');
 const adminSettingsRoutes = require('./routes/adminSettings');
+const pushRoutes          = require('./routes/push');
 const { runDailyRoi }  = require('./controllers/planController');
 
 const app  = express();

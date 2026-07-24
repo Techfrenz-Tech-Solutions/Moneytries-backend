@@ -114,8 +114,4 @@ async function assignMemberId(userId) {
   }
 }
 
-<<<<<<< HEAD
 module.exports = { ensureMemberIdSchema, assignMemberId };
-=======
-module.exports = { ensureMemberIdSchema, assignMemberId };
->>>>>>> 749c0cbe15b9b59cfd67e55851a4cbc4ab5c06e1
