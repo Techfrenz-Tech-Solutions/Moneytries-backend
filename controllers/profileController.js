@@ -237,28 +237,43 @@ async function uploadAvatar(req, res) {
     return fail(res, 'No image file provided', 422);
   }
 
-  // Relative path stored in DB: avatars/<userId>/<filename>
-  const relPath = `avatars/${userId}/${req.file.filename}`;
+  // If Cloudinary is active, f.path holds the CDN URL; store it directly.
+  // For local disk, build the relative path as before.
+  const storedValue = req.file.path && req.file.path.startsWith('http')
+    ? req.file.path
+    : `avatars/${userId}/${req.file.filename}`;
 
   try {
     await ensureProfileColumns();
 
-    // Delete old avatar from disk before updating the DB record
+    // Delete old avatar (Cloudinary or disk)
     const [rows] = await db.execute(
       'SELECT profile_image FROM users WHERE id = ? LIMIT 1',
       [userId]
     );
-    const oldRel = rows[0]?.profile_image;
-    if (oldRel) {
-      const oldFull = path.join(__dirname, '..', 'uploads', oldRel);
-      if (fs.existsSync(oldFull)) {
-        fs.unlinkSync(oldFull);
+    const oldStored = rows[0]?.profile_image;
+    if (oldStored) {
+      if (oldStored.startsWith('http')) {
+        // Cloudinary: extract public_id and destroy
+        try {
+          const cloudinary = require('cloudinary').v2;
+          // public_id is everything after the last slash, minus the extension
+          const urlParts = oldStored.split('/');
+          const folder   = urlParts.slice(-2, -1)[0]; // e.g. "7"
+          const file     = urlParts[urlParts.length - 1].split('.')[0]; // e.g. "avatar-123"
+          await cloudinary.uploader.destroy(`avatars/${folder}/${file}`);
+        } catch (_) { /* non-fatal */ }
+      } else {
+        const oldFull = path.join(__dirname, '..', 'uploads', oldStored);
+        if (fs.existsSync(oldFull)) {
+          fs.unlinkSync(oldFull);
+        }
       }
     }
 
     await db.execute(
       'UPDATE users SET profile_image = ? WHERE id = ?',
-      [relPath, userId]
+      [storedValue, userId]
     );
 
     createNotification(
@@ -268,12 +283,19 @@ async function uploadAvatar(req, res) {
       'Your profile photo has been updated successfully.'
     ).catch(e => console.error('[profile] uploadAvatar notify error:', e.message));
 
-    return ok(res, 'Avatar uploaded', { profile_image: relPath });
+    return ok(res, 'Avatar uploaded', { profile_image: storedValue });
   } catch (err) {
-    // If DB update fails, clean up the newly uploaded file so disk stays in sync
-    const newFull = path.join(__dirname, '..', 'uploads', relPath);
-    if (fs.existsSync(newFull)) {
-      try { fs.unlinkSync(newFull); } catch (_) {}
+    // If DB update fails, clean up the newly uploaded file
+    if (storedValue.startsWith('http')) {
+      try {
+        const cloudinary = require('cloudinary').v2;
+        if (req.file.filename) await cloudinary.uploader.destroy(req.file.filename);
+      } catch (_) {}
+    } else {
+      const newFull = path.join(__dirname, '..', 'uploads', storedValue);
+      if (fs.existsSync(newFull)) {
+        try { fs.unlinkSync(newFull); } catch (_) {}
+      }
     }
     console.error('[profile] uploadAvatar error:', err.message);
     return fail(res, 'Failed to save avatar', 500);
@@ -292,13 +314,23 @@ async function deleteAvatar(req, res) {
       [userId]
     );
 
-    const relPath = rows[0]?.profile_image;
+    const storedValue = rows[0]?.profile_image;
 
-    // Remove file from disk if it exists
-    if (relPath) {
-      const fullPath = path.join(__dirname, '..', 'uploads', relPath);
-      if (fs.existsSync(fullPath)) {
-        fs.unlinkSync(fullPath);
+    if (storedValue) {
+      if (storedValue.startsWith('http')) {
+        // Cloudinary: extract public_id and destroy
+        try {
+          const cloudinary = require('cloudinary').v2;
+          const urlParts = storedValue.split('/');
+          const folder   = urlParts.slice(-2, -1)[0];
+          const file     = urlParts[urlParts.length - 1].split('.')[0];
+          await cloudinary.uploader.destroy(`avatars/${folder}/${file}`);
+        } catch (_) { /* non-fatal */ }
+      } else {
+        const fullPath = path.join(__dirname, '..', 'uploads', storedValue);
+        if (fs.existsSync(fullPath)) {
+          fs.unlinkSync(fullPath);
+        }
       }
     }
 

@@ -82,28 +82,42 @@ async function setUserKycStatus(conn, userId, status) {
 }
 
 /**
- * Delete uploaded files from disk.
+ * Delete uploaded files — from Cloudinary if the path is a CDN URL,
+ * or from local disk otherwise.
  * Called when a submission fails after files have already been written.
  */
 function cleanupFiles(files) {
   if (!files) return;
+  const cloudinary = (() => {
+    try { return require('cloudinary').v2; } catch (_) { return null; }
+  })();
+
   Object.values(files).forEach((arr) =>
     arr.forEach((f) => {
-      try { fs.unlinkSync(f.path); } catch (_) { /* ignore */ }
+      try {
+        if (f.path && f.path.startsWith('http') && cloudinary && f.filename) {
+          // f.filename from multer-storage-cloudinary is the public_id
+          cloudinary.uploader.destroy(f.filename).catch(() => {});
+        } else {
+          fs.unlinkSync(f.path);
+        }
+      } catch (_) { /* ignore */ }
     })
   );
 }
 
 /**
  * Build the public-facing URL for a stored file.
- * When a request object is provided the full absolute URL is returned
- * (e.g. http://192.168.1.10:3000/uploads/kyc/…) so mobile clients can
- * load the image directly.  Falls back to the relative path when no
- * request context is available (e.g. admin list endpoint).
+ *
+ * - If the stored path is already a full URL (Cloudinary CDN), return it as-is.
+ * - Otherwise build an absolute URL from BASE_URL / request host for locally
+ *   stored files (local dev fallback).
  */
-function fileUrl(relPath, req) {
-  if (!relPath) return null;
-  const relative = `/uploads/${relPath}`;
+function fileUrl(relOrAbsPath, req) {
+  if (!relOrAbsPath) return null;
+  // Already a full URL (Cloudinary or any absolute URL stored in DB)
+  if (relOrAbsPath.startsWith('http')) return relOrAbsPath;
+  const relative = `/uploads/${relOrAbsPath}`;
   if (!req) return relative;
   const baseUrl = process.env.BASE_URL
     ? process.env.BASE_URL.replace(/\/$/, '')
@@ -112,10 +126,21 @@ function fileUrl(relPath, req) {
 }
 
 /**
- * Strip absolute prefix up to and including 'uploads/' or 'uploads\'.
- * Works on both Linux and Windows dev machines.
+ * Extract the storable path/URL from a multer file object.
+ *
+ * - Cloudinary storage sets `file.path` to the full HTTPS CDN URL.
+ * - Disk storage sets `file.path` to the absolute local path.
+ *
+ * For Cloudinary files we store the full URL directly.
+ * For disk files we strip the absolute prefix down to the relative
+ * portion after 'uploads/' so fileUrl() can reconstruct it.
  */
 function relPath(f) {
+  // Cloudinary: multer-storage-cloudinary puts the CDN URL in f.path
+  if (f.path && f.path.startsWith('http')) {
+    return f.path; // store full URL as-is
+  }
+  // Local disk: strip everything up to and including 'uploads/'
   const normalized = f.path.replace(/\\/g, '/');
   const idx = normalized.indexOf('/uploads/');
   if (idx !== -1) {

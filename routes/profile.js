@@ -6,6 +6,8 @@ const multer    = require('multer');
 const path      = require('path');
 const fs        = require('fs');
 const rateLimit = require('express-rate-limit');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 const { authenticate } = require('../middleware/auth');
 const {
@@ -17,6 +19,13 @@ const {
 
 const router = express.Router();
 
+// ── Cloudinary configuration ──────────────────────────────────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
 // ── Rate limiter for avatar uploads (prevents abuse) ─────────────────────────
 const avatarUploadLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,   // 1 hour
@@ -27,22 +36,42 @@ const avatarUploadLimiter = rateLimit({
 });
 
 // ── Multer storage for profile avatars ───────────────────────────────────────
-const storage = multer.diskStorage({
-  destination(req, _file, cb) {
-    const userId = req.user?.sub || 'unknown';
-    const dir = path.join(__dirname, '..', 'uploads', 'avatars', String(userId));
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
-    } catch (err) {
-      cb(err);
-    }
-  },
-  filename(_req, file, cb) {
-    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
-    cb(null, `avatar-${Date.now()}${ext}`);
-  },
-});
+
+const useCloudinary =
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET;
+
+let storage;
+
+if (useCloudinary) {
+  storage = new CloudinaryStorage({
+    cloudinary,
+    params: (req, file) => ({
+      folder: `avatars/${req.user?.sub || 'unknown'}`,
+      public_id: `avatar-${Date.now()}`,
+      resource_type: 'image',
+      format: undefined,
+    }),
+  });
+} else {
+  storage = multer.diskStorage({
+    destination(req, _file, cb) {
+      const userId = req.user?.sub || 'unknown';
+      const dir = path.join(__dirname, '..', 'uploads', 'avatars', String(userId));
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+      } catch (err) {
+        cb(err);
+      }
+    },
+    filename(_req, file, cb) {
+      const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+      cb(null, `avatar-${Date.now()}${ext}`);
+    },
+  });
+}
 
 const ALLOWED_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif']);
 const ALLOWED_MIMES      = new Set([

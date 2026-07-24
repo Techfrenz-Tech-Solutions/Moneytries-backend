@@ -47,11 +47,17 @@ ensureBalanceColumn();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function fileUrl(relPath) {
-  return relPath ? `/uploads/${relPath}` : null;
+function fileUrl(storedPath) {
+  if (!storedPath) return null;
+  // Cloudinary URLs are stored as full https:// URLs — return as-is
+  if (storedPath.startsWith('http')) return storedPath;
+  return `/uploads/${storedPath}`;
 }
 
 function relPath(f) {
+  // Cloudinary: multer-storage-cloudinary puts the CDN URL in f.path
+  if (f.path && f.path.startsWith('http')) return f.path;
+  // Local disk: strip everything up to and including 'uploads/'
   const normalized = f.path.replace(/\\/g, '/');
   const idx = normalized.indexOf('/uploads/');
   if (idx !== -1) return normalized.slice(idx + '/uploads/'.length);

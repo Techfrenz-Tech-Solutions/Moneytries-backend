@@ -3,6 +3,8 @@ const express = require('express');
 const multer  = require('multer');
 const path    = require('path');
 const fs      = require('fs');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 const { authenticate }  = require('../middleware/auth');
 const { requireAdmin }  = require('../middleware/admin');
@@ -17,20 +19,46 @@ const {
 
 const router = express.Router();
 
-// ── Multer storage for deposit screenshots ────────────────────────────────────
-const storage = multer.diskStorage({
-  destination(req, _file, cb) {
-    const userId = req.user?.sub || 'unknown';
-    const dir = path.join(__dirname, '..', 'uploads', 'deposits', String(userId));
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename(_req, file, cb) {
-    // Derive extension from original filename when MIME is generic
-    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
-    cb(null, `screenshot-${Date.now()}${ext}`);
-  },
+// ── Cloudinary configuration ──────────────────────────────────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
+
+// ── Multer storage for deposit screenshots ────────────────────────────────────
+
+const useCloudinary =
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET;
+
+let storage;
+
+if (useCloudinary) {
+  storage = new CloudinaryStorage({
+    cloudinary,
+    params: (req, file) => ({
+      folder: `deposits/${req.user?.sub || 'unknown'}`,
+      public_id: `screenshot-${Date.now()}`,
+      resource_type: 'image',
+      format: undefined,
+    }),
+  });
+} else {
+  storage = multer.diskStorage({
+    destination(req, _file, cb) {
+      const userId = req.user?.sub || 'unknown';
+      const dir = path.join(__dirname, '..', 'uploads', 'deposits', String(userId));
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename(_req, file, cb) {
+      const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+      cb(null, `screenshot-${Date.now()}${ext}`);
+    },
+  });
+}
 
 // Image extensions that are always acceptable regardless of reported MIME type.
 // Android devices frequently send application/octet-stream for gallery images,

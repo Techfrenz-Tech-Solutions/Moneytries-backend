@@ -3,6 +3,8 @@ const express  = require('express');
 const multer   = require('multer');
 const path     = require('path');
 const fs       = require('fs');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 const { authenticate }                      = require('../middleware/auth');
 const { requireAdmin }                      = require('../middleware/admin');
@@ -10,27 +12,56 @@ const { submitKyc, getKycStatus, reviewKyc, listKyc, getKycById } = require('../
 
 const router = express.Router();
 
+// ── Cloudinary configuration ──────────────────────────────────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
 // ── Multer storage ────────────────────────────────────────────────────────────
 
 /**
- * Files land at:
- *   uploads/kyc/<userId>/<fieldname>-<timestamp>.<ext>
+ * When Cloudinary env vars are present, files are uploaded directly to
+ * Cloudinary (persistent, CDN-backed).  Falls back to local disk storage for
+ * local development when the vars are not set.
  *
- * The `uploads/` directory is served as a static resource in server.js.
+ * Cloudinary path:  kyc/<userId>/<fieldname>-<timestamp>
+ * Local path:       uploads/kyc/<userId>/<fieldname>-<timestamp>.<ext>
  */
-const storage = multer.diskStorage({
-  destination(req, _file, cb) {
-    const userId  = req.user?.sub || 'unknown';
-    const dir     = path.join(__dirname, '..', 'uploads', 'kyc', String(userId));
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename(_req, file, cb) {
-    const ext  = path.extname(file.originalname).toLowerCase() || '.jpg';
-    const name = `${file.fieldname}-${Date.now()}${ext}`;
-    cb(null, name);
-  },
-});
+const useCloudinary =
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET;
+
+let storage;
+
+if (useCloudinary) {
+  storage = new CloudinaryStorage({
+    cloudinary,
+    params: (req, file) => ({
+      folder: `kyc/${req.user?.sub || 'unknown'}`,
+      public_id: `${file.fieldname}-${Date.now()}`,
+      resource_type: 'image',
+      // Keep originals; let Cloudinary detect format
+      format: undefined,
+    }),
+  });
+} else {
+  storage = multer.diskStorage({
+    destination(req, _file, cb) {
+      const userId = req.user?.sub || 'unknown';
+      const dir    = path.join(__dirname, '..', 'uploads', 'kyc', String(userId));
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename(_req, file, cb) {
+      const ext  = path.extname(file.originalname).toLowerCase() || '.jpg';
+      const name = `${file.fieldname}-${Date.now()}${ext}`;
+      cb(null, name);
+    },
+  });
+}
 
 /**
  * Accept all common image formats that mobile devices can produce:
