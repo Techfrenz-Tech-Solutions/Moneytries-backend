@@ -169,6 +169,23 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
   for (const [key, value] of Object.entries(data)) {
     stringData[key] = value === null || value === undefined ? '' : String(value);
   }
+  // Title/body are duplicated into `data` as a fallback for the app's own
+  // foreground handler (see push_notification_service.dart), in addition
+  // to the top-level `notification` block below.
+  //
+  // IMPORTANT — do not remove the top-level `notification` block again:
+  // it is what lets Android auto-display the notification in the
+  // background/terminated state WITHOUT needing the app's Dart background
+  // isolate to run at all. A lot of real Android OEMs (Xiaomi/MIUI,
+  // Vivo/Funtouch, Oppo/ColorOS, Realme UI, etc.) restrict background
+  // isolate execution for apps that aren't manually whitelisted in their
+  // battery/autostart settings — a data-only message silently never
+  // arrives on such a device, while a `notification` block still shows up
+  // every time, since the OS itself (not app code) renders it. The app
+  // only needs to handle display itself for the ONE state the OS never
+  // auto-displays in: while the app is already open in the foreground.
+  stringData.title = title || '';
+  stringData.body  = body  || '';
 
   try {
     const response = await messaging.sendEachForMulticast({
@@ -191,6 +208,7 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
         },
       },
       apns: {
+        headers: { 'apns-priority': '10' },
         payload: {
           aps: { sound: 'default', badge: 1, 'content-available': 1 },
         },
