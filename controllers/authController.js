@@ -11,7 +11,11 @@ const { isEmailOtpVerified, clearVerifiedEmailOtp } = require('./emailOtpControl
 const { ensureSecurityColumns } = require('./securityController');
 const { ensureMemberIdSchema, assignMemberId } = require('../utils/memberId');
 const { assignReferralCode } = require('../utils/referralCode');
-const { clearTokensForUser } = require('../utils/pushService');
+const { clearTokensForUser, getTokensForUser, sendPushToTokens } = require('../utils/pushService');
+// Admin Dashboard analytics: Today's Active Users + User Login Attempts.
+// Fire-and-forget by design (see recordLoginAttempt's own doc comment) — it
+// never affects the outcome of the auth request it's called from.
+const { recordLoginAttempt } = require('./loginAnalyticsController');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 const LOGIN_OTP_EXPIRY_MINUTES = 5;
@@ -97,8 +101,50 @@ async function issueSessionAndToken(user) {
     'UPDATE users SET active_session_id = ? WHERE id = ?',
     [sessionId, user.id]
   );
+
+  // Capture whichever device's FCM token(s) are on file *before* they get
+  // wiped below, so the "New Login Detected" push can still reach that
+  // outgoing device. (See notifyPreviousDevice doc comment.) This read is
+  // purely additive — it doesn't touch active_session_id or the
+  // clearTokensForUser call, so Single Device Login itself is unchanged.
+  const previousDeviceTokens = await getTokensForUser(user.id);
+
   await clearTokensForUser(user.id);
+
+  notifyPreviousDevice(previousDeviceTokens);
+
   return signToken(user, sessionId);
+}
+
+/**
+ * Sends the "New Login Detected" push straight to the outgoing device's own
+ * FCM token(s), captured just before Single Device Login clears them.
+ *
+ * This is the fix for the push going to the wrong device: previously the
+ * "New Login Detected" push (fired later, from recordLoginEvent /
+ * createNotification) was addressed by user_id and resolved via
+ * device_tokens at send time — but by then device_tokens for this user_id
+ * already only contains the *new* device's token (the old one was cleared
+ * here, and the new device typically finishes its own register-token call
+ * before that later request lands), so the alert about the new login was
+ * being delivered to the new device instead of the one it's warning.
+ * Sending it here, straight to the captured old token(s), reaches the
+ * correct device — and does so at the actual moment of takeover, before
+ * anything could race it. The corresponding DB notification row (for the
+ * in-app Notification screen) is still written by recordLoginEvent as
+ * before; only its redundant/misdirected push is skipped there now (see
+ * createNotificationSilent in notificationController.js).
+ *
+ * Fire-and-forget: never awaited by callers, never allowed to affect the
+ * login response.
+ */
+function notifyPreviousDevice(tokens) {
+  if (!tokens || tokens.length === 0) return; // no previous device — nothing to warn
+  sendPushToTokens(tokens, {
+    title: 'New Login Detected',
+    body: "A new login was detected on your account. If this wasn't you, please secure your account immediately.",
+    data: { type: 'system', route: '/notifications' },
+  }, 'previous device').catch(e => console.error('[issueSessionAndToken] notifyPreviousDevice error:', e.message));
 }
 
 /**
@@ -254,6 +300,16 @@ async function register(req, res) {
 
     const token = await issueSessionAndToken(user);
 
+    // A brand-new registration is also this user's first "login" for
+    // Today's Active Users purposes — record it the same as a normal login.
+    recordLoginAttempt(req, {
+      userId: user.id,
+      userName: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+      identifier: user.email || user.phone,
+      status: 'success',
+      eventType: 'register',
+    });
+
     if (trimmedReferralCode) {
       processReferralOnSignup(result.insertId, trimmedReferralCode).catch(e =>
         console.error('[register] referral hook error:', e.message)
@@ -310,17 +366,36 @@ async function login(req, res) {
     );
 
     if (rows.length === 0) {
+      recordLoginAttempt(req, {
+        identifier: value,
+        status: 'failed',
+        failureReason: 'Invalid credentials',
+      });
       return fail(res, 'Invalid credentials. Please check and try again.', 401);
     }
 
     const user = rows[0];
 
     if (!user.is_active) {
+      recordLoginAttempt(req, {
+        userId: user.id,
+        userName: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+        identifier: value,
+        status: 'failed',
+        failureReason: 'Account deactivated',
+      });
       return fail(res, 'Your account has been deactivated. Please contact support.', 403);
     }
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
+      recordLoginAttempt(req, {
+        userId: user.id,
+        userName: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+        identifier: value,
+        status: 'failed',
+        failureReason: 'Incorrect password',
+      });
       return fail(res, 'Invalid credentials. Please check and try again.', 401);
     }
 
@@ -344,6 +419,14 @@ async function login(req, res) {
 
     // ── Normal (non-2FA) flow ────────────────────────────────────────────
     const token = await issueSessionAndToken(user);
+
+    recordLoginAttempt(req, {
+      userId: user.id,
+      userName: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+      identifier: value,
+      status: 'success',
+      eventType: 'login',
+    });
 
     return ok(res, 'Login successful', {
       requires_2fa: false,
@@ -421,7 +504,14 @@ async function verifyLoginOtp(req, res) {
       return fail(res, 'Your account has been deactivated. Please contact support.', 403);
     }
 
+    const userLabel = `${user.first_name || ''} ${user.last_name || ''}`.trim();
+    const userIdentifier = user.email || user.phone;
+
     if (!user.two_factor_otp) {
+      recordLoginAttempt(req, {
+        userId: user.id, userName: userLabel, identifier: userIdentifier,
+        status: 'failed', failureReason: 'No OTP requested',
+      });
       return fail(res, 'No OTP requested. Please request a new OTP.', 400);
     }
 
@@ -430,10 +520,18 @@ async function verifyLoginOtp(req, res) {
         'UPDATE users SET two_factor_otp = NULL, two_factor_otp_expires_at = NULL WHERE id = ?',
         [user.id]
       );
+      recordLoginAttempt(req, {
+        userId: user.id, userName: userLabel, identifier: userIdentifier,
+        status: 'failed', failureReason: 'OTP expired',
+      });
       return fail(res, 'OTP has expired. Please request a new one.', 400);
     }
 
     if (user.two_factor_otp !== otp) {
+      recordLoginAttempt(req, {
+        userId: user.id, userName: userLabel, identifier: userIdentifier,
+        status: 'failed', failureReason: 'Invalid OTP',
+      });
       return fail(res, 'Invalid OTP. Please try again.', 400);
     }
 
@@ -445,6 +543,11 @@ async function verifyLoginOtp(req, res) {
     );
 
     const token = await issueSessionAndToken(user);
+
+    recordLoginAttempt(req, {
+      userId: user.id, userName: userLabel, identifier: userIdentifier,
+      status: 'success', eventType: 'login',
+    });
 
     return ok(res, 'Login successful', {
       requires_2fa: false,

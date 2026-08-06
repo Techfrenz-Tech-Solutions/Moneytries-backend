@@ -3,7 +3,7 @@ const bcrypt     = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
 const db         = require('../config/db');
 const { ok, fail } = require('../utils/response');
-const { createNotification } = require('./notificationController');
+const { createNotification, createNotificationSilent } = require('./notificationController');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 
@@ -801,7 +801,13 @@ async function recordLoginEvent(req, res) {
     );
 
     if (success) {
-      createNotification(
+      // Row-only insert (no push) — the push for this event was already
+      // sent directly to the outgoing device at the moment of login (see
+      // authController.notifyPreviousDevice). Pushing again here, by
+      // user_id, would resolve to the *new* device's token instead (the old
+      // one is gone from device_tokens by now), which is exactly the bug
+      // this fix addresses: the alert reaching the wrong device.
+      createNotificationSilent(
         req.user.sub,
         'system',
         'New Login Detected',

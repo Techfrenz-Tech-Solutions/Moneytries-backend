@@ -296,6 +296,29 @@ async function createNotification(userId, type, title, message) {
   }
 }
 
+// ── Internal helper: insert a notification without firing a push ────────────
+// Same as createNotification, but skips pushForNotification. Used where the
+// push for this event has already been (or deliberately shouldn't be) sent
+// via device_tokens lookup by user_id — e.g. "New Login Detected", whose
+// push must reach the *outgoing* device (sent directly from
+// authController.notifyPreviousDevice at login time, using that device's
+// token captured before Single Device Login clears it) rather than whatever
+// device_tokens resolves to for this user_id by the time this row is
+// written, which by then is the new device — the opposite of who the push
+// is meant to warn.
+async function createNotificationSilent(userId, type, title, message) {
+  try {
+    await ensureNotificationsTable();
+    await db.execute(
+      'INSERT INTO notifications (user_id, type, title, message) VALUES (?, ?, ?, ?)',
+      [userId, type, title, message]
+    );
+  } catch (err) {
+    // Non-fatal — log and continue
+    console.error('[notification] createNotificationSilent error:', err.message);
+  }
+}
+
 // ── Internal helper: insert a notification with an explicit created_at ───────
 // Used for backdated events — e.g. daily ROI catch-up, where a notification
 // for a day the user was offline should show that day's date/time rather
@@ -314,4 +337,4 @@ async function createNotificationAt(userId, type, title, message, createdAt) {
   }
 }
 
-module.exports = { getNotifications, adminGetUserNotifications, markAsRead, markAllRead, deleteNotification, createNotification, createNotificationAt };
+module.exports = { getNotifications, adminGetUserNotifications, markAsRead, markAllRead, deleteNotification, createNotification, createNotificationSilent, createNotificationAt };

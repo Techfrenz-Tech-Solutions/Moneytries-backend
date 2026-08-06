@@ -159,11 +159,40 @@ async function removeTokens(tokens) {
  * truth shown on the in-app Notification screen.
  */
 async function sendPushToUser(userId, { title, body, data = {} }) {
-  const messaging = getMessaging();
-  if (!messaging) return; // FCM not configured — no-op
-
   const tokens = await getTokensForUser(userId);
-  if (tokens.length === 0) return;
+  if (tokens.length === 0) {
+    console.log(`[pushService] no device tokens on file for user=${userId} — nothing to send`);
+    return;
+  }
+  return sendPushToTokens(tokens, { title, body, data }, `user=${userId}`);
+}
+
+/**
+ * Same delivery logic as sendPushToUser, but targets an explicit list of FCM
+ * tokens instead of looking up whatever is currently on file for a user_id.
+ *
+ * Needed for cases where the recipient device's token must no longer be on
+ * file for that user_id by the time the push actually goes out — e.g. the
+ * "New Login Detected" alert, which has to reach the device that Single
+ * Device Login just kicked out. That device's token gets deleted from
+ * device_tokens the instant the new device logs in (see
+ * authController.issueSessionAndToken / clearTokensForUser above), so a
+ * lookup by user_id at send time would only ever find the new device's
+ * token, not the old one. The caller is expected to have captured the old
+ * token(s) beforehand (e.g. via getTokensForUser) and pass them in here.
+ */
+async function sendPushToTokens(tokens, { title, body, data = {} }, logLabel = '') {
+  const messaging = getMessaging();
+  if (!messaging) {
+    console.warn(`[pushService] messaging not configured — skipping push${logLabel ? ` for ${logLabel}` : ''}`);
+    return; // FCM not configured — no-op
+  }
+
+  if (!tokens || tokens.length === 0) {
+    console.log(`[pushService] no tokens provided${logLabel ? ` for ${logLabel}` : ''} — nothing to send`);
+    return;
+  }
+  console.log(`[pushService] sending push${logLabel ? ` to ${logLabel}` : ''} (${tokens.length} token(s)): "${title}"`);
 
   const stringData = {};
   for (const [key, value] of Object.entries(data)) {
@@ -230,8 +259,14 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
       }
     });
     if (deadTokens.length) await removeTokens(deadTokens);
+
+    console.log(
+      `[pushService] push${logLabel ? ` to ${logLabel}` : ''} complete — ` +
+      `${response.successCount} succeeded, ${response.failureCount} failed` +
+      (deadTokens.length ? `, ${deadTokens.length} dead token(s) pruned` : '')
+    );
   } catch (err) {
-    console.error('[pushService] sendPushToUser error:', err.message);
+    console.error('[pushService] sendPushToTokens error:', err.message);
   }
 }
 
@@ -242,4 +277,5 @@ module.exports = {
   clearTokensForUser,
   getTokensForUser,
   sendPushToUser,
+  sendPushToTokens,
 };

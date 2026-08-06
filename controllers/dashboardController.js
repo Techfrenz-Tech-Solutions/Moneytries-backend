@@ -98,6 +98,7 @@ async function getDashboardSummary(_req, res) {
       roiThisMonth, roiPrevMonth,
       openTickets, ticketsThisWeek, ticketsPrevWeek,
       pendingKyc, pendingDeposits,
+      todayActiveUsers, todayLoginAttempts,
     ] = await Promise.all([
       scalar(`SELECT COUNT(*) v FROM users WHERE role='user'`),
       scalar(`SELECT COUNT(*) v FROM users WHERE role='user' AND created_at <= DATE_SUB(NOW(), INTERVAL 30 DAY)`),
@@ -120,6 +121,16 @@ async function getDashboardSummary(_req, res) {
       scalar(`SELECT COUNT(*) v FROM support_tickets WHERE created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)`),
       scalar(`SELECT COUNT(*) v FROM kyc_submissions WHERE status='pending'`),
       scalar(`SELECT COUNT(*) v FROM deposits WHERE order_status='pending'`),
+      // Today's Active Users: unique users (by user_id) with at least one
+      // successful login/open event today (server time). Covers both newly
+      // registered users who log in today and existing users who open the
+      // app today, each counted once. Resets automatically at midnight
+      // server time since it's always scoped to CURDATE() — no cron needed.
+      scalar(`SELECT COUNT(DISTINCT user_id) v FROM login_attempts
+                WHERE status='success' AND user_id IS NOT NULL AND DATE(created_at) = CURDATE()`),
+      // User Login Attempts: every login/open event today, success or
+      // failed — a user opening the app 10 times today counts as 10.
+      scalar(`SELECT COUNT(*) v FROM login_attempts WHERE DATE(created_at) = CURDATE()`),
     ]);
 
     const usersDelta = pctDelta(totalUsers, usersBaseline);
@@ -158,6 +169,14 @@ async function getDashboardSummary(_req, res) {
       {
         id: 'support-tickets', label: 'Open Support Tickets', value: openTickets.toLocaleString('en-IN'),
         delta: ticketsDelta.delta, trend: 'up-is-bad-down-is-good', tone: 'red', icon: 'headset',
+      },
+      {
+        id: 'today-active-users', label: "Today's Active Users", value: todayActiveUsers.toLocaleString('en-IN'),
+        tone: 'blu', icon: 'user-check', to: '/login-attempts',
+      },
+      {
+        id: 'today-login-attempts', label: "Today's Login Attempts", value: todayLoginAttempts.toLocaleString('en-IN'),
+        tone: 'vio', icon: 'activity', to: '/login-attempts',
       },
     ];
 

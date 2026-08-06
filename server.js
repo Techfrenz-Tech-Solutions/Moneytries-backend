@@ -19,9 +19,11 @@ const referralRoutes     = require('./routes/referral');
 const securityRoutes     = require('./routes/security');
 const usersRoutes        = require('./routes/users');
 const adminUsersRoutes   = require('./routes/adminUsers');
+const adminLoginAttemptsRoutes = require('./routes/adminLoginAttempts');
 const dashboardRoutes    = require('./routes/dashboard');
 const adminSettingsRoutes = require('./routes/adminSettings');
 const pushRoutes          = require('./routes/push');
+const { getMessaging }    = require('./config/firebase');
 const { runDailyRoi, ensureSchema: ensurePlanSchema } = require('./controllers/planController');
 const { ensureMemberIdSchema } = require('./utils/memberId');
 const db = require('./config/db');
@@ -92,8 +94,23 @@ app.use('/api/referral',       referralRoutes);
 app.use('/api/security',       securityRoutes);
 app.use('/api/users',          usersRoutes);
 app.use('/api/admin/users',    adminUsersRoutes);
+app.use('/api/admin/login-attempts', adminLoginAttemptsRoutes);
 app.use('/api/admin/settings', adminSettingsRoutes);
 app.use('/api/dashboard',      dashboardRoutes);
+
+// ROOT CAUSE (fixed): routes/push.js was written and imported above
+// (`pushRoutes`, line 25) as part of the Firebase notification feature,
+// but was never actually mounted onto the Express app. Every single call
+// the Flutter app makes to POST /api/push/register-token or
+// /api/push/unregister-token was therefore hitting the 404 catch-all
+// below instead of controllers/pushController.js — so no FCM token ever
+// reached the `device_tokens` table, and utils/pushService.js's
+// sendPushToUser() always found zero tokens for every user and silently
+// no-op'd. This is why notifications stopped working end-to-end (no push
+// ever left the server) while everything else — permissions, channel,
+// icon, in-app notification list — was already correctly implemented on
+// both the app and server. This one line is the fix.
+app.use('/api/push',           pushRoutes);
 
 // Health check
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
@@ -144,6 +161,12 @@ async function start() {
 
   app.listen(PORT, () => {
     console.log(`🚀  GreenVault API running on http://localhost:${PORT}`);
+    // Force Firebase Admin init (and its own success/warning log line —
+    // see config/firebase.js) right at boot instead of lazily on the
+    // first push, so a missing/bad FIREBASE_SERVICE_ACCOUNT_* is visible
+    // in the startup logs immediately rather than only surfacing later.
+    const pushConfigured = !!getMessaging();
+    console.log(`[push] /api/push mounted — FCM ${pushConfigured ? 'configured' : 'NOT configured'}`);
     scheduleDailyRoi();
   });
 }

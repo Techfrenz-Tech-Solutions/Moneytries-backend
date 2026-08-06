@@ -15,6 +15,10 @@ async function registerToken(req, res) {
 
   try {
     await registerDeviceToken(req.user.sub, fcm_token, platform);
+    console.log(
+      `[push] token registered for user=${req.user.sub} platform=${platform || 'android'} ` +
+      `token=${fcm_token.slice(0, 12)}...`
+    );
     return ok(res, 'Device token registered');
   } catch (err) {
     console.error('[push] registerToken error:', err.message);
@@ -34,6 +38,7 @@ async function unregisterToken(req, res) {
 
   try {
     await unregisterDeviceToken(req.user.sub, fcm_token);
+    console.log(`[push] token unregistered for user=${req.user.sub}`);
     return ok(res, 'Device token unregistered');
   } catch (err) {
     console.error('[push] unregisterToken error:', err.message);
