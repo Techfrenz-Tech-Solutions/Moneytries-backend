@@ -95,7 +95,7 @@ async function issueLoginOtp(userId) {
  * the table with exactly its token — the previous device is never in the
  * table to receive anything in between, even while it's offline.
  */
-async function issueSessionAndToken(user) {
+async function issueSessionAndToken(user, newDeviceInfo) {
   const sessionId = crypto.randomUUID();
   await db.execute(
     'UPDATE users SET active_session_id = ? WHERE id = ?',
@@ -111,9 +111,63 @@ async function issueSessionAndToken(user) {
 
   await clearTokensForUser(user.id);
 
-  notifyPreviousDevice(previousDeviceTokens);
+  notifyPreviousDevice(previousDeviceTokens, newDeviceInfo);
 
   return signToken(user, sessionId);
+}
+
+/**
+ * Pulls the optional device-context fields a login/register/2FA-verify
+ * request may carry (see ApiService.login/register/verifyLoginOtp on the
+ * Flutter side — device_name was already sent for login analytics;
+ * device_model / device_manufacturer / os_version are the new fields added
+ * so the "New Login Detected" push can describe the new device in detail).
+ * Every field is optional — a missing one is simply left out of the
+ * eventual notification text, never blocks login.
+ */
+function extractDeviceInfo(req) {
+  const b = req.body || {};
+  const clean = (v) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, 191) : null;
+  return {
+    deviceName:   clean(b.device_name),
+    model:        clean(b.device_model),
+    manufacturer: clean(b.device_manufacturer),
+    osVersion:    clean(b.os_version),
+  };
+}
+
+/** "6 Aug 2026, 3:45 PM" — matches the style already used for login history
+ * timestamps (see securityController._formatTimestamp). */
+function formatLoginTime(date) {
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const h = date.getHours();
+  const m = date.getMinutes().toString().padStart(2, '0');
+  const period = h >= 12 ? 'PM' : 'AM';
+  const hour = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}, ${hour}:${m} ${period}`;
+}
+
+/**
+ * Builds the "New Login Detected" body text, folding in whichever of the
+ * new device's details are available: device name, model, manufacturer,
+ * Android version, and the login time (captured at the moment this push is
+ * actually sent, i.e. right as the takeover happens). Every detail is
+ * optional so the message degrades gracefully if the requesting client is
+ * older / didn't send them, rather than showing blank fields.
+ */
+function buildNewLoginMessage(newDeviceInfo) {
+  const info = newDeviceInfo || {};
+  const deviceLabel = info.deviceName || 'a new device';
+
+  const details = [];
+  if (info.manufacturer) details.push(`Manufacturer: ${info.manufacturer}`);
+  if (info.model)        details.push(`Model: ${info.model}`);
+  if (info.osVersion)    details.push(`Android ${info.osVersion}`);
+  const detailStr = details.length ? ` (${details.join(', ')})` : '';
+
+  const loginTime = formatLoginTime(new Date());
+
+  return `A new device logged into your account: ${deviceLabel}${detailStr}. Login time: ${loginTime}. If this wasn't you, please secure your account immediately.`;
 }
 
 /**
@@ -135,14 +189,18 @@ async function issueSessionAndToken(user) {
  * before; only its redundant/misdirected push is skipped there now (see
  * createNotificationSilent in notificationController.js).
  *
+ * `newDeviceInfo` (see extractDeviceInfo) carries the new device's own
+ * details straight from its login/register/2FA-verify request, so the
+ * message can tell Device 1 exactly what logged in as Device 2.
+ *
  * Fire-and-forget: never awaited by callers, never allowed to affect the
  * login response.
  */
-function notifyPreviousDevice(tokens) {
+function notifyPreviousDevice(tokens, newDeviceInfo) {
   if (!tokens || tokens.length === 0) return; // no previous device — nothing to warn
   sendPushToTokens(tokens, {
     title: 'New Login Detected',
-    body: "A new login was detected on your account. If this wasn't you, please secure your account immediately.",
+    body: buildNewLoginMessage(newDeviceInfo),
     data: { type: 'system', route: '/notifications' },
   }, 'previous device').catch(e => console.error('[issueSessionAndToken] notifyPreviousDevice error:', e.message));
 }
@@ -298,7 +356,7 @@ async function register(req, res) {
       console.error('[register] assignReferralCode error:', e.message);
     }
 
-    const token = await issueSessionAndToken(user);
+    const token = await issueSessionAndToken(user, extractDeviceInfo(req));
 
     // A brand-new registration is also this user's first "login" for
     // Today's Active Users purposes — record it the same as a normal login.
@@ -418,7 +476,7 @@ async function login(req, res) {
     }
 
     // ── Normal (non-2FA) flow ────────────────────────────────────────────
-    const token = await issueSessionAndToken(user);
+    const token = await issueSessionAndToken(user, extractDeviceInfo(req));
 
     recordLoginAttempt(req, {
       userId: user.id,
@@ -542,7 +600,7 @@ async function verifyLoginOtp(req, res) {
       [user.id]
     );
 
-    const token = await issueSessionAndToken(user);
+    const token = await issueSessionAndToken(user, extractDeviceInfo(req));
 
     recordLoginAttempt(req, {
       userId: user.id, userName: userLabel, identifier: userIdentifier,

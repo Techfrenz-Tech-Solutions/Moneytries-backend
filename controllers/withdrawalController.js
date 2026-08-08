@@ -46,6 +46,16 @@ async function ensureBalanceColumns() {
 // Run once on module load (non-blocking)
 ensureBalanceColumns();
 
+// ── Business rule: min / max single-transaction withdrawal amount ─────────────
+// No single withdrawal (wallet or vault) may be below ₹200 or exceed
+// ₹100,000 (1 Lakh). This is the authoritative, always-enforced guard —
+// enforced once in validateRequest() below, which both walletWithdrawRequest
+// and vaultWithdrawRequest call before doing anything else.
+const MIN_WITHDRAWAL_AMOUNT = 200;
+const MAX_WITHDRAWAL_AMOUNT = 100000;
+const MIN_AMOUNT_MESSAGE = 'The minimum withdrawal amount is ₹200.';
+const MAX_AMOUNT_MESSAGE = 'The maximum allowed withdrawal amount is ₹100,000.';
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function generateReferenceId() {
@@ -175,6 +185,14 @@ async function validateRequest(req, res, { requireBalanceColumn, type }) {
 
   if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
     fail(res, 'Invalid amount.', 422);
+    return null;
+  }
+  if (Number(amount) < MIN_WITHDRAWAL_AMOUNT) {
+    fail(res, MIN_AMOUNT_MESSAGE, 422);
+    return null;
+  }
+  if (Number(amount) > MAX_WITHDRAWAL_AMOUNT) {
+    fail(res, MAX_AMOUNT_MESSAGE, 422);
     return null;
   }
 

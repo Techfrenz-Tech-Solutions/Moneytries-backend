@@ -17,15 +17,17 @@ const PLAN_MONTHS = {
   '12_month': 12,
 };
 
-// ── Business rule: maximum single-transaction investment amount ───────────────
-// No single investment plan's one-time invested amount may exceed ₹100,000
-// (1 Lakh). This gates the amount chosen when a plan is enrolled
-// (enrollPlan) — that is the only payment the plan will ever receive (the
-// one-time investment model has no recurring instalments), so this single
-// check is the only place a user-supplied plan amount is ever written.
-// Existing plans already enrolled before this rule keep their original
-// amount untouched.
+// ── Business rule: min / max single-transaction investment amount ─────────────
+// No single investment plan's one-time invested amount may be below ₹500 or
+// exceed ₹100,000 (1 Lakh). This gates the amount chosen when a plan is
+// enrolled (enrollPlan) — that is the only payment the plan will ever
+// receive (the one-time investment model has no recurring instalments), so
+// this single check is the only place a user-supplied plan amount is ever
+// written. Existing plans already enrolled before this rule keep their
+// original amount untouched.
+const MIN_PLAN_AMOUNT = 500;
 const MAX_PLAN_AMOUNT = 100000;
+const MIN_AMOUNT_MESSAGE = 'The minimum investment amount is ₹500.';
 const MAX_AMOUNT_MESSAGE = 'The maximum allowed deposit or plan amount is ₹100,000.';
 
 // Human-readable plan name used in ROI notification text, e.g. "3 Month Plan".
@@ -569,6 +571,7 @@ async function enrollPlan(req, res) {
 
   const amount = Number(monthly_amount);
   if (!amount || amount <= 0) return fail(res, 'Invalid monthly_amount.', 422);
+  if (amount < MIN_PLAN_AMOUNT) return fail(res, MIN_AMOUNT_MESSAGE, 422);
   if (amount > MAX_PLAN_AMOUNT) return fail(res, MAX_AMOUNT_MESSAGE, 422);
   if (!utr_id || utr_id.trim().length < 6) return fail(res, 'Invalid UTR ID.', 422);
 
@@ -1362,26 +1365,32 @@ async function creditDailyRoiNotifications(plan, planId, tiers, dailyRate, start
       const dayAmount = Math.round(dayAmountRaw * 100) / 100;
 
       try {
+        // Capture the actual moment this day is credited, and use that
+        // SAME timestamp for both the roi_daily_credits row and its
+        // notification — previously the notification's `created_at` was
+        // synthesized as a fixed 9:00 AM UTC (2:30 PM IST) via
+        // `setUTCHours(9, 0, 0, 0)`, which is why every "Daily ROI
+        // Credited" notification always showed 2:30 PM regardless of when
+        // the ROI was actually credited, while the Home screen's "Recent
+        // Transactions" (sourced from roi_daily_credits.created_at, a real
+        // DB-assigned timestamp) correctly showed the real credit time.
+        // Explicitly writing the same `creditedAt` value to both rows
+        // keeps them perfectly in sync.
+        const creditedAt = new Date();
+
         const [insertResult] = await db.execute(
-          `INSERT IGNORE INTO roi_daily_credits (plan_id, user_id, credit_date, amount)
-           VALUES (?, ?, ?, ?)`,
-          [planId, plan.user_id, creditDateStr, dayAmountRaw]
+          `INSERT IGNORE INTO roi_daily_credits (plan_id, user_id, credit_date, amount, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [planId, plan.user_id, creditDateStr, dayAmountRaw, creditedAt]
         );
 
         if (insertResult.affectedRows > 0 && dayAmount > 0) {
-          // Timestamp the notification with the actual day it's for (at a
-          // fixed daily-crediting time) rather than "now", so backfilled
-          // notifications show the correct historical date/time instead of
-          // all clustering at the moment the catch-up ran.
-          const notifiedAt = new Date(cursor.getTime());
-          notifiedAt.setUTCHours(9, 0, 0, 0);
-
           await createNotificationAt(
             plan.user_id,
             'roi',
             'Daily ROI Credited',
             `₹${dayAmount.toLocaleString('en-IN', { minimumFractionDigits: dayAmount % 1 === 0 ? 0 : 2, maximumFractionDigits: 2 })} Daily ROI credited successfully for your ${planName}.`,
-            notifiedAt
+            creditedAt
           );
         }
       } catch (dayErr) {
