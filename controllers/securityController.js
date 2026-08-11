@@ -12,6 +12,22 @@ const PASSWORD_CHANGE_MAX_ATTEMPTS = 5;
 const PASSWORD_CHANGE_LOCK_MS = 5 * 60 * 1000;      // 5 minutes
 const PASSWORD_CHANGE_VERIFIED_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
+// ── Account Login PIN → Change Login PIN policy ────────────────────────────
+// Mirrors the Change Password policy above, but for the account's 4-digit
+// Login PIN (login_pin_hash).
+const LOGIN_PIN_CHANGE_MAX_ATTEMPTS = 5;
+const LOGIN_PIN_CHANGE_LOCK_MS = 5 * 60 * 1000;      // 5 minutes
+const LOGIN_PIN_CHANGE_VERIFIED_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+// ── Withdrawal PIN → Change Withdrawal PIN policy ──────────────────────────
+// Mirrors the Change Login PIN policy above, but for the account's 4-digit
+// Withdrawal PIN (withdrawal_pin_hash). Enforced entirely server-side so the
+// 5-attempt cap / 5-minute lockout cannot be bypassed by restarting the app,
+// clearing local storage, or calling the API directly.
+const WITHDRAWAL_PIN_CHANGE_MAX_ATTEMPTS = 5;
+const WITHDRAWAL_PIN_CHANGE_LOCK_MS = 5 * 60 * 1000;      // 5 minutes
+const WITHDRAWAL_PIN_CHANGE_VERIFIED_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
 // ── One-time migration ────────────────────────────────────────────────────────
 let _migrated = false;
 // In-flight promise guard. Without this, several requests arriving at once
@@ -103,10 +119,63 @@ async function _runSecurityColumnsMigration() {
         sql: `ALTER TABLE users ADD COLUMN login_pin_hash VARCHAR(255) DEFAULT NULL`,
       },
       {
+        // Login PIN → Change Login PIN flow: number of consecutive
+        // incorrect "current PIN" attempts since the last success or
+        // lockout. Reset to 0 on a correct verification and whenever a
+        // lockout window (see login_pin_change_locked_until) expires.
+        col: 'login_pin_change_failed_attempts',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_change_failed_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0`,
+      },
+      {
+        // Set once login_pin_change_failed_attempts reaches the 5-attempt
+        // cap. While in the future, POST /api/security/pin/login/change/verify
+        // is rejected with 423 and the remaining lock seconds so the app can
+        // show a countdown. Cleared automatically once it elapses.
+        col: 'login_pin_change_locked_until',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_change_locked_until TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        // Short-lived proof that the account owner just supplied the
+        // correct current Login PIN. Set by
+        // POST /api/security/pin/login/change/verify on success and
+        // required by POST /api/security/pin/login/change/update — this is
+        // what lets "Set New PIN" be a separate step/screen from re-entering
+        // the current PIN.
+        col: 'login_pin_change_verified_until',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_change_verified_until TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
         // Account-level Withdrawal PIN, mirrors login_pin_hash above but
         // for the separate 4-digit PIN required to confirm withdrawals.
         col: 'withdrawal_pin_hash',
         sql: `ALTER TABLE users ADD COLUMN withdrawal_pin_hash VARCHAR(255) DEFAULT NULL`,
+      },
+      {
+        // Withdrawal PIN → Change Withdrawal PIN flow: number of consecutive
+        // incorrect "current PIN" attempts since the last success or
+        // lockout. Reset to 0 on a correct verification and whenever a
+        // lockout window (see withdrawal_pin_change_locked_until) expires.
+        col: 'withdrawal_pin_change_failed_attempts',
+        sql: `ALTER TABLE users ADD COLUMN withdrawal_pin_change_failed_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0`,
+      },
+      {
+        // Set once withdrawal_pin_change_failed_attempts reaches the
+        // 5-attempt cap. While in the future,
+        // POST /api/security/pin/withdrawal/change/verify is rejected with
+        // 423 and the remaining lock seconds so the app can show a
+        // countdown. Cleared automatically once it elapses.
+        col: 'withdrawal_pin_change_locked_until',
+        sql: `ALTER TABLE users ADD COLUMN withdrawal_pin_change_locked_until TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        // Short-lived proof that the account owner just supplied the
+        // correct current Withdrawal PIN. Set by
+        // POST /api/security/pin/withdrawal/change/verify on success and
+        // required by POST /api/security/pin/withdrawal/change/update —
+        // this is what lets "Set New PIN" be a separate step/screen from
+        // re-entering the current PIN.
+        col: 'withdrawal_pin_change_verified_until',
+        sql: `ALTER TABLE users ADD COLUMN withdrawal_pin_change_verified_until TIMESTAMP NULL DEFAULT NULL`,
       },
       {
         // Account-level 'Biometric Login' preference. The biometric
@@ -975,6 +1044,225 @@ async function verifyLoginPin(req, res) {
   }
 }
 
+// ── Account Login PIN → Change Login PIN (current-PIN verification + lockout) ─
+// Mirrors the Login Credentials → Change Password flow above, but for the
+// account's 4-digit Login PIN (login_pin_hash). Two-step flow, fully
+// enforced server-side so the attempt cap can't be bypassed by the client:
+//   1. POST /api/security/pin/login/change/verify  — confirm the current PIN
+//      (server-side attempt counter, 5-attempt cap, 5-minute lockout)
+//   2. POST /api/security/pin/login/change/update   — set the new PIN, only
+//      within the short window opened by a successful step-1 verification
+// GET /api/security/pin/login/change/status lets the app resume the correct
+// UI (locked countdown vs. remaining attempts) if the user re-opens Change
+// Login PIN after backgrounding/killing the app mid-lockout.
+
+async function getLoginPinChangeStatus(req, res) {
+  await ensureSecurityColumns();
+  try {
+    const [rows] = await db.execute(
+      `SELECT login_pin_hash, login_pin_change_failed_attempts, login_pin_change_locked_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    const lockedUntil = user.login_pin_change_locked_until
+      ? new Date(user.login_pin_change_locked_until)
+      : null;
+    const now = new Date();
+
+    if (lockedUntil && lockedUntil > now) {
+      return ok(res, 'Change Login PIN is temporarily locked', {
+        locked: true,
+        remaining_seconds: Math.ceil((lockedUntil - now) / 1000),
+        remaining_attempts: 0,
+        pin_set: !!user.login_pin_hash,
+      });
+    }
+
+    return ok(res, 'Change Login PIN status fetched', {
+      locked: false,
+      remaining_seconds: 0,
+      remaining_attempts:
+        LOGIN_PIN_CHANGE_MAX_ATTEMPTS - (user.login_pin_change_failed_attempts || 0),
+      pin_set: !!user.login_pin_hash,
+    });
+  } catch (err) {
+    console.error('[getLoginPinChangeStatus]', err);
+    return fail(res, 'Failed to fetch status.', 500);
+  }
+}
+
+async function verifyCurrentLoginPin(req, res) {
+  await ensureSecurityColumns();
+  const { current_pin } = req.body;
+  if (!_isValidPin(current_pin)) return fail(res, 'Current PIN is required', 422);
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, login_pin_hash, login_pin_change_failed_attempts,
+              login_pin_change_locked_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    if (!user.login_pin_hash) {
+      return fail(res, 'No Login PIN is set on this account yet.', 400);
+    }
+
+    const now = new Date();
+    let failedAttempts = user.login_pin_change_failed_attempts || 0;
+    const lockedUntil = user.login_pin_change_locked_until
+      ? new Date(user.login_pin_change_locked_until)
+      : null;
+
+    // Still inside an active lockout window — reject without even checking
+    // the PIN so a locked-out attacker can't keep probing.
+    if (lockedUntil && lockedUntil > now) {
+      return res.status(423).json({
+        success: false,
+        message: 'Too many incorrect attempts. Please try again later.',
+        data: {
+          locked: true,
+          remaining_seconds: Math.ceil((lockedUntil - now) / 1000),
+          remaining_attempts: 0,
+        },
+      });
+    }
+
+    // A previous lockout has elapsed — clear it before evaluating this
+    // attempt so the user gets a fresh set of tries.
+    if (lockedUntil && lockedUntil <= now) {
+      failedAttempts = 0;
+    }
+
+    const valid = await bcrypt.compare(current_pin, user.login_pin_hash);
+
+    if (!valid) {
+      failedAttempts += 1;
+
+      if (failedAttempts >= LOGIN_PIN_CHANGE_MAX_ATTEMPTS) {
+        const newLockedUntil = new Date(Date.now() + LOGIN_PIN_CHANGE_LOCK_MS);
+        await db.execute(
+          `UPDATE users
+             SET login_pin_change_failed_attempts = 0,
+                 login_pin_change_locked_until = ?
+             WHERE id = ?`,
+          [newLockedUntil, user.id]
+        );
+        return res.status(423).json({
+          success: false,
+          message: 'Too many incorrect attempts. Login PIN verification has been locked for 5 minutes.',
+          data: {
+            locked: true,
+            remaining_seconds: Math.ceil(LOGIN_PIN_CHANGE_LOCK_MS / 1000),
+            remaining_attempts: 0,
+          },
+        });
+      }
+
+      await db.execute(
+        `UPDATE users
+           SET login_pin_change_failed_attempts = ?,
+               login_pin_change_locked_until = NULL
+           WHERE id = ?`,
+        [failedAttempts, user.id]
+      );
+
+      return res.status(401).json({
+        success: false,
+        message: 'Incorrect PIN',
+        data: {
+          locked: false,
+          remaining_seconds: 0,
+          remaining_attempts: LOGIN_PIN_CHANGE_MAX_ATTEMPTS - failedAttempts,
+        },
+      });
+    }
+
+    // Correct PIN — reset the attempt counter and open a short verification
+    // window for the "New PIN" step.
+    const verifiedUntil = new Date(Date.now() + LOGIN_PIN_CHANGE_VERIFIED_WINDOW_MS);
+    await db.execute(
+      `UPDATE users
+         SET login_pin_change_failed_attempts = 0,
+             login_pin_change_locked_until = NULL,
+             login_pin_change_verified_until = ?
+         WHERE id = ?`,
+      [verifiedUntil, user.id]
+    );
+
+    return ok(res, 'PIN verified', {
+      verified: true,
+      verified_window_seconds: Math.ceil(LOGIN_PIN_CHANGE_VERIFIED_WINDOW_MS / 1000),
+    });
+  } catch (err) {
+    console.error('[verifyCurrentLoginPin]', err);
+    return fail(res, 'Failed to verify PIN. Please try again.', 500);
+  }
+}
+
+async function updateLoginPin(req, res) {
+  await ensureSecurityColumns();
+  const { new_pin, confirm_pin } = req.body;
+  if (!_isValidPin(new_pin)) return fail(res, PIN_RULES_MESSAGE, 422);
+  if (confirm_pin !== undefined && new_pin !== confirm_pin) {
+    return fail(res, 'New PIN and confirmation do not match', 400);
+  }
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, login_pin_hash, login_pin_change_verified_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    const verifiedUntil = user.login_pin_change_verified_until
+      ? new Date(user.login_pin_change_verified_until)
+      : null;
+
+    if (!verifiedUntil || verifiedUntil <= new Date()) {
+      return fail(res, 'Verification expired. Please re-enter your current PIN.', 401);
+    }
+
+    const sameAsOld = user.login_pin_hash
+      ? await bcrypt.compare(new_pin, user.login_pin_hash)
+      : false;
+    if (sameAsOld) {
+      return fail(res, 'New PIN must be different from your current PIN.', 400);
+    }
+
+    const newHash = await bcrypt.hash(new_pin, SALT_ROUNDS);
+
+    await db.execute(
+      `UPDATE users
+         SET login_pin_hash = ?,
+             login_pin_change_verified_until = NULL,
+             login_pin_change_failed_attempts = 0,
+             login_pin_change_locked_until = NULL
+         WHERE id = ?`,
+      [newHash, user.id]
+    );
+
+    createNotification(
+      user.id, 'system', 'Login PIN Updated',
+      'Your Login PIN was changed and is now active on all your devices. If this wasn\'t you, please contact support immediately.'
+    ).catch(e => console.error('[updateLoginPin] notify error:', e.message));
+
+    return ok(res, 'Login PIN changed successfully');
+  } catch (err) {
+    console.error('[updateLoginPin]', err);
+    return fail(res, 'Failed to save Login PIN. Please try again.', 500);
+  }
+}
+
 async function setWithdrawalPin(req, res) {
   await ensureSecurityColumns();
   const { current_pin, new_pin } = req.body;
@@ -1021,6 +1309,227 @@ async function verifyWithdrawalPinRemote(req, res) {
   } catch (err) {
     console.error('[verifyWithdrawalPinRemote]', err);
     return fail(res, 'Failed to verify withdrawal PIN. Please try again.', 500);
+  }
+}
+
+// ── Withdrawal PIN → Change Withdrawal PIN (server-enforced) ───────────────
+// Two-step flow, mirroring Change Login PIN:
+//   1. POST /api/security/pin/withdrawal/change/verify  — confirm the
+//      current PIN (server-side attempt counter, 5-attempt cap, 5-minute
+//      lockout)
+//   2. POST /api/security/pin/withdrawal/change/update   — set the new PIN,
+//      only within the short window opened by a successful step-1
+//      verification
+// GET /api/security/pin/withdrawal/change/status lets the app resume the
+// correct UI (locked countdown vs. remaining attempts) if the user
+// re-opens Change Withdrawal PIN after backgrounding/killing the app
+// mid-lockout.
+
+async function getWithdrawalPinChangeStatus(req, res) {
+  await ensureSecurityColumns();
+  try {
+    const [rows] = await db.execute(
+      `SELECT withdrawal_pin_hash, withdrawal_pin_change_failed_attempts,
+              withdrawal_pin_change_locked_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    const lockedUntil = user.withdrawal_pin_change_locked_until
+      ? new Date(user.withdrawal_pin_change_locked_until)
+      : null;
+    const now = new Date();
+
+    if (lockedUntil && lockedUntil > now) {
+      return ok(res, 'Change Withdrawal PIN is temporarily locked', {
+        locked: true,
+        remaining_seconds: Math.ceil((lockedUntil - now) / 1000),
+        remaining_attempts: 0,
+        pin_set: !!user.withdrawal_pin_hash,
+      });
+    }
+
+    return ok(res, 'Change Withdrawal PIN status fetched', {
+      locked: false,
+      remaining_seconds: 0,
+      remaining_attempts:
+        WITHDRAWAL_PIN_CHANGE_MAX_ATTEMPTS - (user.withdrawal_pin_change_failed_attempts || 0),
+      pin_set: !!user.withdrawal_pin_hash,
+    });
+  } catch (err) {
+    console.error('[getWithdrawalPinChangeStatus]', err);
+    return fail(res, 'Failed to fetch status.', 500);
+  }
+}
+
+async function verifyCurrentWithdrawalPin(req, res) {
+  await ensureSecurityColumns();
+  const { current_pin } = req.body;
+  if (!_isValidPin(current_pin)) return fail(res, 'Current PIN is required', 422);
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, withdrawal_pin_hash, withdrawal_pin_change_failed_attempts,
+              withdrawal_pin_change_locked_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    if (!user.withdrawal_pin_hash) {
+      return fail(res, 'No Withdrawal PIN is set on this account yet.', 400);
+    }
+
+    const now = new Date();
+    let failedAttempts = user.withdrawal_pin_change_failed_attempts || 0;
+    const lockedUntil = user.withdrawal_pin_change_locked_until
+      ? new Date(user.withdrawal_pin_change_locked_until)
+      : null;
+
+    // Still inside an active lockout window — reject without even checking
+    // the PIN so a locked-out attacker can't keep probing.
+    if (lockedUntil && lockedUntil > now) {
+      return res.status(423).json({
+        success: false,
+        message: 'Too many incorrect attempts. Please try again later.',
+        data: {
+          locked: true,
+          remaining_seconds: Math.ceil((lockedUntil - now) / 1000),
+          remaining_attempts: 0,
+        },
+      });
+    }
+
+    // A previous lockout has elapsed — clear it before evaluating this
+    // attempt so the user gets a fresh set of tries.
+    if (lockedUntil && lockedUntil <= now) {
+      failedAttempts = 0;
+    }
+
+    const valid = await bcrypt.compare(current_pin, user.withdrawal_pin_hash);
+
+    if (!valid) {
+      failedAttempts += 1;
+
+      if (failedAttempts >= WITHDRAWAL_PIN_CHANGE_MAX_ATTEMPTS) {
+        const newLockedUntil = new Date(Date.now() + WITHDRAWAL_PIN_CHANGE_LOCK_MS);
+        await db.execute(
+          `UPDATE users
+             SET withdrawal_pin_change_failed_attempts = 0,
+                 withdrawal_pin_change_locked_until = ?
+             WHERE id = ?`,
+          [newLockedUntil, user.id]
+        );
+        return res.status(423).json({
+          success: false,
+          message: 'Too many incorrect attempts. Withdrawal PIN verification has been locked for 5 minutes.',
+          data: {
+            locked: true,
+            remaining_seconds: Math.ceil(WITHDRAWAL_PIN_CHANGE_LOCK_MS / 1000),
+            remaining_attempts: 0,
+          },
+        });
+      }
+
+      await db.execute(
+        `UPDATE users
+           SET withdrawal_pin_change_failed_attempts = ?,
+               withdrawal_pin_change_locked_until = NULL
+           WHERE id = ?`,
+        [failedAttempts, user.id]
+      );
+
+      return res.status(401).json({
+        success: false,
+        message: 'Incorrect PIN',
+        data: {
+          locked: false,
+          remaining_seconds: 0,
+          remaining_attempts: WITHDRAWAL_PIN_CHANGE_MAX_ATTEMPTS - failedAttempts,
+        },
+      });
+    }
+
+    // Correct PIN — reset the attempt counter and open a short verification
+    // window for the "New PIN" step.
+    const verifiedUntil = new Date(Date.now() + WITHDRAWAL_PIN_CHANGE_VERIFIED_WINDOW_MS);
+    await db.execute(
+      `UPDATE users
+         SET withdrawal_pin_change_failed_attempts = 0,
+             withdrawal_pin_change_locked_until = NULL,
+             withdrawal_pin_change_verified_until = ?
+         WHERE id = ?`,
+      [verifiedUntil, user.id]
+    );
+
+    return ok(res, 'PIN verified', {
+      verified: true,
+      verified_window_seconds: Math.ceil(WITHDRAWAL_PIN_CHANGE_VERIFIED_WINDOW_MS / 1000),
+    });
+  } catch (err) {
+    console.error('[verifyCurrentWithdrawalPin]', err);
+    return fail(res, 'Failed to verify PIN. Please try again.', 500);
+  }
+}
+
+async function updateWithdrawalPin(req, res) {
+  await ensureSecurityColumns();
+  const { new_pin, confirm_pin } = req.body;
+  if (!_isValidPin(new_pin)) return fail(res, PIN_RULES_MESSAGE, 422);
+  if (confirm_pin !== undefined && new_pin !== confirm_pin) {
+    return fail(res, 'New PIN and confirmation do not match', 400);
+  }
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, withdrawal_pin_hash, withdrawal_pin_change_verified_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    const verifiedUntil = user.withdrawal_pin_change_verified_until
+      ? new Date(user.withdrawal_pin_change_verified_until)
+      : null;
+
+    if (!verifiedUntil || verifiedUntil <= new Date()) {
+      return fail(res, 'Verification expired. Please re-enter your current PIN.', 401);
+    }
+
+    const sameAsOld = user.withdrawal_pin_hash
+      ? await bcrypt.compare(new_pin, user.withdrawal_pin_hash)
+      : false;
+    if (sameAsOld) {
+      return fail(res, 'New PIN must be different from your current PIN.', 400);
+    }
+
+    const newHash = await bcrypt.hash(new_pin, SALT_ROUNDS);
+
+    await db.execute(
+      `UPDATE users
+         SET withdrawal_pin_hash = ?,
+             withdrawal_pin_change_verified_until = NULL,
+             withdrawal_pin_change_failed_attempts = 0,
+             withdrawal_pin_change_locked_until = NULL
+         WHERE id = ?`,
+      [newHash, user.id]
+    );
+
+    createNotification(
+      user.id, 'system', 'Withdrawal PIN Updated',
+      'Your Withdrawal PIN was changed and is now active on all your devices. If this wasn\'t you, please contact support immediately.'
+    ).catch(e => console.error('[updateWithdrawalPin] notify error:', e.message));
+
+    return ok(res, 'Withdrawal PIN changed successfully');
+  } catch (err) {
+    console.error('[updateWithdrawalPin]', err);
+    return fail(res, 'Failed to save Withdrawal PIN. Please try again.', 500);
   }
 }
 
@@ -1080,8 +1589,14 @@ module.exports = {
   getPinsStatus,
   setLoginPin,
   verifyLoginPin,
+  getLoginPinChangeStatus,
+  verifyCurrentLoginPin,
+  updateLoginPin,
   setWithdrawalPin,
   verifyWithdrawalPinRemote,
+  getWithdrawalPinChangeStatus,
+  verifyCurrentWithdrawalPin,
+  updateWithdrawalPin,
   getBiometricStatus,
   setBiometricEnabled,
 };
