@@ -112,8 +112,10 @@ CREATE TABLE IF NOT EXISTS kyc_submissions (
   id                  INT UNSIGNED  NOT NULL AUTO_INCREMENT,
   user_id             INT UNSIGNED  NOT NULL,
 
+  aadhaar_number      VARCHAR(14)   NOT NULL,
   aadhaar_front_path  VARCHAR(512)  NOT NULL,
   aadhaar_back_path   VARCHAR(512)  NOT NULL,
+  pan_number          VARCHAR(10)   NOT NULL,
   pan_front_path      VARCHAR(512)  NOT NULL,
   selfie_path         VARCHAR(512)  NOT NULL,
 
@@ -124,6 +126,7 @@ CREATE TABLE IF NOT EXISTS kyc_submissions (
   bank_branch         VARCHAR(120)  DEFAULT NULL,
   bank_city           VARCHAR(80)   DEFAULT NULL,
   bank_state          VARCHAR(80)   DEFAULT NULL,
+  bank_passbook_front_path VARCHAR(512) NOT NULL,
 
   status              ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
   rejection_reason    TEXT          DEFAULT NULL,

@@ -4,6 +4,10 @@ const { body, validationResult } = require('express-validator');
 const db         = require('../config/db');
 const { ok, fail } = require('../utils/response');
 const { createNotification, createNotificationSilent } = require('./notificationController');
+// Today's Active Users / Today's Login Attempts (Admin Dashboard) must count
+// PIN-only unlocks the same way they count email/password logins — see
+// verifyLoginPin below.
+const { recordLoginAttempt } = require('./loginAnalyticsController');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 
@@ -1030,13 +1034,33 @@ async function verifyLoginPin(req, res) {
   if (!_isValidPin(pin)) return fail(res, PIN_RULES_MESSAGE, 422);
   try {
     const [rows] = await db.execute(
-      'SELECT login_pin_hash FROM users WHERE id = ? LIMIT 1',
+      `SELECT login_pin_hash, first_name, last_name, email, phone
+         FROM users WHERE id = ? LIMIT 1`,
       [req.user.sub]
     );
     if (rows.length === 0) return fail(res, 'User not found', 404);
-    const hash = rows[0].login_pin_hash;
+    const user = rows[0];
+    const hash = user.login_pin_hash;
     if (!hash) return ok(res, 'No Login PIN set on this account', { valid: false, pin_set: false });
+
     const valid = await bcrypt.compare(pin, hash);
+
+    // Record this PIN-only unlock exactly like a normal email/password
+    // login — same login_attempts table that powers the Admin Dashboard's
+    // "Today's Active Users" and "Today's Login Attempts" cards, tagged
+    // with login_method: 'pin' so it's distinguishable in the Login
+    // Attempts admin page. Fire-and-forget: never blocks or affects the
+    // outcome of this request (see recordLoginAttempt's own doc comment).
+    recordLoginAttempt(req, {
+      userId: req.user.sub,
+      userName: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+      identifier: user.email || user.phone,
+      status: valid ? 'success' : 'failed',
+      failureReason: valid ? null : 'Incorrect PIN',
+      eventType: 'login',
+      loginMethod: 'pin',
+    });
+
     return ok(res, valid ? 'PIN verified' : 'Incorrect PIN', { valid, pin_set: true });
   } catch (err) {
     console.error('[verifyLoginPin]', err);

@@ -96,16 +96,18 @@ const upload = multer({
 
 /**
  * Field map that mirrors the Flutter KycFormData / _submitKyc multipart request:
- *   aadhaar_front  — Aadhaar card front image
- *   aadhaar_back   — Aadhaar card back image
- *   pan_front      — PAN card front image
- *   selfie         — Selfie / liveness photo
+ *   aadhaar_front        — Aadhaar card front image
+ *   aadhaar_back         — Aadhaar card back image
+ *   pan_front            — PAN card front image
+ *   selfie               — Selfie / liveness photo
+ *   bank_passbook_front  — Bank passbook front page image
  */
 const kycUpload = upload.fields([
-  { name: 'aadhaar_front', maxCount: 1 },
-  { name: 'aadhaar_back',  maxCount: 1 },
-  { name: 'pan_front',     maxCount: 1 },
-  { name: 'selfie',        maxCount: 1 },
+  { name: 'aadhaar_front',       maxCount: 1 },
+  { name: 'aadhaar_back',        maxCount: 1 },
+  { name: 'pan_front',           maxCount: 1 },
+  { name: 'selfie',              maxCount: 1 },
+  { name: 'bank_passbook_front', maxCount: 1 },
 ]);
 
 /**
@@ -147,8 +149,9 @@ function handleMulterError(err, _req, res, next) {
  * Authenticated user submits their KYC documents.
  *
  * multipart/form-data fields:
- *   Files  : aadhaar_front, aadhaar_back, pan_front, selfie
- *   Text   : accountHolderName, accountNumber, ifscCode,
+ *   Files  : aadhaar_front, aadhaar_back, pan_front, selfie, bank_passbook_front
+ *   Text   : aadhaarNumber, panNumber,
+ *            accountHolderName, accountNumber, ifscCode,
  *            bankName, bankBranch, bankCity, bankState
  */
 router.post(

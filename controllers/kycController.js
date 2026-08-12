@@ -52,6 +52,88 @@ async function ensureKycStatusColumn() {
 // Run once on module load (non-blocking)
 ensureKycStatusColumn();
 
+// ── One-time column migration ─────────────────────────────────────────────────
+//
+// Adds the aadhaar_number, pan_number and bank_passbook_front_path columns to
+// kyc_submissions for installs whose table was created before these columns
+// were added to schema.sql (same CREATE TABLE IF NOT EXISTS limitation as
+// kyc_status above).
+
+let _kycExtraColumnsVerified = false;
+
+async function ensureKycExtraColumns() {
+  if (_kycExtraColumnsVerified) return;
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'kyc_submissions'
+          AND COLUMN_NAME IN ('aadhaar_number', 'pan_number', 'bank_passbook_front_path')`
+    );
+
+    const existing = new Set(rows.map((r) => r.COLUMN_NAME));
+
+    if (!existing.has('aadhaar_number')) {
+      console.warn('[kyc] aadhaar_number column missing — running migration…');
+      await db.execute(
+        `ALTER TABLE kyc_submissions
+           ADD COLUMN aadhaar_number VARCHAR(14) NOT NULL DEFAULT ''
+           AFTER user_id`
+      );
+    }
+
+    if (!existing.has('pan_number')) {
+      console.warn('[kyc] pan_number column missing — running migration…');
+      await db.execute(
+        `ALTER TABLE kyc_submissions
+           ADD COLUMN pan_number VARCHAR(10) NOT NULL DEFAULT ''
+           AFTER pan_front_path`
+      );
+    }
+
+    if (!existing.has('bank_passbook_front_path')) {
+      console.warn('[kyc] bank_passbook_front_path column missing — running migration…');
+      await db.execute(
+        `ALTER TABLE kyc_submissions
+           ADD COLUMN bank_passbook_front_path VARCHAR(512) NOT NULL DEFAULT ''
+           AFTER bank_state`
+      );
+    }
+
+    if (rows.length) {
+      console.log('[kyc] ✅  KYC extra columns verified/migrated on kyc_submissions.');
+    }
+
+    _kycExtraColumnsVerified = true;
+  } catch (err) {
+    console.error('[kyc] Extra-columns migration check failed:', err.message);
+  }
+}
+
+// Run once on module load (non-blocking)
+ensureKycExtraColumns();
+
+// ── Validation helpers ────────────────────────────────────────────────────────
+
+/** Aadhaar: exactly 12 digits, accepted either as "XXXX XXXX XXXX" or plain. */
+function isValidAadhaarNumber(value) {
+  const digitsOnly = (value || '').replace(/\s+/g, '');
+  return /^\d{12}$/.test(digitsOnly);
+}
+
+/** Normalizes an Aadhaar number to the "XXXX XXXX XXXX" display format. */
+function formatAadhaarNumber(value) {
+  const digitsOnly = (value || '').replace(/\s+/g, '');
+  return digitsOnly.replace(/(\d{4})(?=\d)/g, '$1 ').trim();
+}
+
+/** PAN: 5 letters + 4 digits + 1 letter, always stored uppercase. */
+function isValidPanNumber(value) {
+  return /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/.test((value || '').trim().toUpperCase());
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -159,7 +241,8 @@ async function submitKyc(req, res) {
     const [existing] = await db.execute(
       `SELECT id, status,
               aadhaar_front_path, aadhaar_back_path,
-              pan_front_path, selfie_path
+              pan_front_path, selfie_path,
+              bank_passbook_front_path
          FROM kyc_submissions
         WHERE user_id = ?
         ORDER BY created_at DESC
@@ -181,6 +264,7 @@ async function submitKyc(req, res) {
           prev.aadhaar_back_path,
           prev.pan_front_path,
           prev.selfie_path,
+          prev.bank_passbook_front_path,
         ];
         const filesIntact = docPaths.every(
           (p) => p && fs.existsSync(path.join(__dirname, '..', 'uploads', p))
@@ -216,24 +300,28 @@ async function submitKyc(req, res) {
   // ── 2. Validate required files ────────────────────────────────────────────
   const files = req.files || {};
 
-  const aadhaarFront = files['aadhaar_front']?.[0];
-  const aadhaarBack  = files['aadhaar_back']?.[0];
-  const panFront     = files['pan_front']?.[0];
-  const selfie       = files['selfie']?.[0];
+  const aadhaarFront      = files['aadhaar_front']?.[0];
+  const aadhaarBack       = files['aadhaar_back']?.[0];
+  const panFront          = files['pan_front']?.[0];
+  const selfie            = files['selfie']?.[0];
+  const bankPassbookFront = files['bank_passbook_front']?.[0];
 
   const missingFiles = [];
-  if (!aadhaarFront) missingFiles.push('aadhaar_front');
-  if (!aadhaarBack)  missingFiles.push('aadhaar_back');
-  if (!panFront)     missingFiles.push('pan_front');
-  if (!selfie)       missingFiles.push('selfie');
+  if (!aadhaarFront)      missingFiles.push('aadhaar_front');
+  if (!aadhaarBack)       missingFiles.push('aadhaar_back');
+  if (!panFront)          missingFiles.push('pan_front');
+  if (!selfie)            missingFiles.push('selfie');
+  if (!bankPassbookFront) missingFiles.push('bank_passbook_front');
 
   if (missingFiles.length > 0) {
     cleanupFiles(files);
     return fail(res, `Missing required files: ${missingFiles.join(', ')}`, 422);
   }
 
-  // ── 3. Validate bank fields ───────────────────────────────────────────────
+  // ── 3. Validate Aadhaar number, PAN number and bank fields ────────────────
   const {
+    aadhaarNumber     = '',
+    panNumber         = '',
     accountHolderName = '',
     accountNumber     = '',
     ifscCode          = '',
@@ -242,6 +330,16 @@ async function submitKyc(req, res) {
     bankCity          = '',
     bankState         = '',
   } = req.body;
+
+  if (!isValidAadhaarNumber(aadhaarNumber)) {
+    cleanupFiles(files);
+    return fail(res, 'Invalid Aadhaar number. It must be exactly 12 digits.', 422);
+  }
+
+  if (!isValidPanNumber(panNumber)) {
+    cleanupFiles(files);
+    return fail(res, 'Invalid PAN number. Format must be ABCDE1234F.', 422);
+  }
 
   if (
     !accountHolderName.trim() ||
@@ -261,17 +359,21 @@ async function submitKyc(req, res) {
     const [result] = await connection.execute(
       `INSERT INTO kyc_submissions
          (user_id,
+          aadhaar_number,
           aadhaar_front_path, aadhaar_back_path,
-          pan_front_path,     selfie_path,
+          pan_number,          pan_front_path,     selfie_path,
           account_holder_name, account_number,
           ifsc_code, bank_name, bank_branch,
           bank_city, bank_state,
+          bank_passbook_front_path,
           status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
       [
         userId,
+        formatAadhaarNumber(aadhaarNumber),
         relPath(aadhaarFront),
         relPath(aadhaarBack),
+        panNumber.trim().toUpperCase(),
         relPath(panFront),
         relPath(selfie),
         accountHolderName.trim(),
@@ -281,6 +383,7 @@ async function submitKyc(req, res) {
         bankBranch.trim(),
         bankCity.trim(),
         bankState.trim(),
+        relPath(bankPassbookFront),
       ]
     );
 
@@ -331,11 +434,13 @@ async function getKycStatus(req, res) {
     const [rows] = await db.execute(
       `SELECT
          id, status, rejection_reason,
+         aadhaar_number,
          aadhaar_front_path, aadhaar_back_path,
-         pan_front_path, selfie_path,
+         pan_number, pan_front_path, selfie_path,
          account_holder_name, account_number,
          ifsc_code, bank_name, bank_branch,
          bank_city, bank_state,
+         bank_passbook_front_path,
          created_at, reviewed_at
        FROM kyc_submissions
        WHERE user_id = ?
@@ -352,14 +457,16 @@ async function getKycStatus(req, res) {
 
     const data = {
       ...kyc,
-      aadhaar_front_url: fileUrl(kyc.aadhaar_front_path, req),
-      aadhaar_back_url:  fileUrl(kyc.aadhaar_back_path,  req),
-      pan_front_url:     fileUrl(kyc.pan_front_path,     req),
-      selfie_url:        fileUrl(kyc.selfie_path,        req),
-      aadhaar_front_path: undefined,
-      aadhaar_back_path:  undefined,
-      pan_front_path:     undefined,
-      selfie_path:        undefined,
+      aadhaar_front_url:        fileUrl(kyc.aadhaar_front_path,        req),
+      aadhaar_back_url:         fileUrl(kyc.aadhaar_back_path,         req),
+      pan_front_url:            fileUrl(kyc.pan_front_path,            req),
+      selfie_url:               fileUrl(kyc.selfie_path,               req),
+      bank_passbook_front_url:  fileUrl(kyc.bank_passbook_front_path,  req),
+      aadhaar_front_path:       undefined,
+      aadhaar_back_path:        undefined,
+      pan_front_path:           undefined,
+      selfie_path:              undefined,
+      bank_passbook_front_path: undefined,
     };
 
     return ok(res, 'KYC status fetched', data);
@@ -479,8 +586,9 @@ async function listKyc(req, res) {
          k.id, k.user_id, k.status, k.rejection_reason,
          k.account_holder_name, k.account_number, k.ifsc_code,
          k.bank_name, k.bank_branch, k.bank_city, k.bank_state,
-         k.aadhaar_front_path, k.aadhaar_back_path,
-         k.pan_front_path, k.selfie_path,
+         k.aadhaar_number, k.aadhaar_front_path, k.aadhaar_back_path,
+         k.pan_number, k.pan_front_path, k.selfie_path,
+         k.bank_passbook_front_path,
          k.created_at, k.reviewed_at,
          u.first_name, u.last_name, u.email, u.phone
        FROM kyc_submissions k
@@ -522,8 +630,9 @@ async function getKycById(req, res) {
          k.id, k.user_id, k.status, k.rejection_reason,
          k.account_holder_name, k.account_number, k.ifsc_code,
          k.bank_name, k.bank_branch, k.bank_city, k.bank_state,
-         k.aadhaar_front_path, k.aadhaar_back_path,
-         k.pan_front_path, k.selfie_path,
+         k.aadhaar_number, k.aadhaar_front_path, k.aadhaar_back_path,
+         k.pan_number, k.pan_front_path, k.selfie_path,
+         k.bank_passbook_front_path,
          k.created_at, k.reviewed_at,
          u.first_name, u.last_name, u.email, u.phone
        FROM kyc_submissions k
@@ -537,7 +646,17 @@ async function getKycById(req, res) {
       return fail(res, 'KYC submission not found', 404);
     }
 
-    return ok(res, 'KYC submission fetched', rows[0]);
+    const kyc = rows[0];
+    const data = {
+      ...kyc,
+      aadhaar_front_url:       fileUrl(kyc.aadhaar_front_path, req),
+      aadhaar_back_url:        fileUrl(kyc.aadhaar_back_path,  req),
+      pan_front_url:           fileUrl(kyc.pan_front_path,     req),
+      selfie_url:              fileUrl(kyc.selfie_path,        req),
+      bank_passbook_front_url: fileUrl(kyc.bank_passbook_front_path, req),
+    };
+
+    return ok(res, 'KYC submission fetched', data);
   } catch (err) {
     console.error('[kyc:getById]', err);
     return fail(res, 'Could not fetch KYC submission', 500);

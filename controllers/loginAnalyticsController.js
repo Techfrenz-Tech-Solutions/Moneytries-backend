@@ -59,15 +59,35 @@ async function _runMigration() {
         status         ENUM('success','failed') NOT NULL DEFAULT 'success',
         failure_reason VARCHAR(191)    NULL DEFAULT NULL,
         event_type     ENUM('login','register') NOT NULL DEFAULT 'login',
+        login_method   VARCHAR(20)     NOT NULL DEFAULT 'password',
         created_at     TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
         PRIMARY KEY (id),
         KEY idx_la_user       (user_id),
         KEY idx_la_created    (created_at),
         KEY idx_la_status     (status),
-        KEY idx_la_identifier (identifier)
+        KEY idx_la_identifier (identifier),
+        KEY idx_la_method     (login_method)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    // Widen existing installs (CREATE TABLE IF NOT EXISTS above is a no-op
+    // when the table already exists from before login_method was added) —
+    // mirrors the idempotent column-add pattern in securityController's
+    // ensureSecurityColumns.
+    const [methodCol] = await db.execute(
+      `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'login_attempts'
+          AND COLUMN_NAME  = 'login_method'
+        LIMIT 1`
+    );
+    if (methodCol.length === 0) {
+      await db.execute(
+        `ALTER TABLE login_attempts ADD COLUMN login_method VARCHAR(20) NOT NULL DEFAULT 'password' AFTER event_type`
+      );
+      console.log('[login-analytics] Added column: login_method');
+    }
     _migrated = true;
   } catch (err) {
     console.error('[login-analytics] migration error:', err.message);
@@ -89,6 +109,12 @@ function getClientIp(req) {
 }
 
 const ALLOWED_PLATFORMS = ['android', 'ios', 'web', 'other'];
+const ALLOWED_LOGIN_METHODS = ['password', 'pin'];
+
+function normalizeLoginMethod(raw) {
+  const v = (raw || '').toString().trim().toLowerCase();
+  return ALLOWED_LOGIN_METHODS.includes(v) ? v : 'password';
+}
 
 function normalizePlatform(raw, req) {
   const v = (raw || '').toString().trim().toLowerCase();
@@ -118,7 +144,7 @@ function normalizeDeviceName(raw) {
  * @param {{
  *   userId?: number|null, userName?: string|null, identifier: string,
  *   status: 'success'|'failed', failureReason?: string|null,
- *   eventType?: 'login'|'register'
+ *   eventType?: 'login'|'register', loginMethod?: 'password'|'pin'
  * }} data
  */
 function recordLoginAttempt(req, data) {
@@ -129,6 +155,7 @@ function recordLoginAttempt(req, data) {
     status,
     failureReason = null,
     eventType = 'login',
+    loginMethod = 'password',
   } = data || {};
 
   ensureLoginAnalyticsSchema()
@@ -136,11 +163,12 @@ function recordLoginAttempt(req, data) {
       const deviceName = normalizeDeviceName(req.body && req.body.device_name);
       const platform = normalizePlatform(req.body && req.body.platform, req);
       const ipAddress = getClientIp(req);
+      const method = normalizeLoginMethod(loginMethod);
 
       return db.execute(
         `INSERT INTO login_attempts
-           (user_id, user_name, identifier, device_name, platform, ip_address, status, failure_reason, event_type)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (user_id, user_name, identifier, device_name, platform, ip_address, status, failure_reason, event_type, login_method)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           userId,
           userName || null,
@@ -151,6 +179,7 @@ function recordLoginAttempt(req, data) {
           status === 'failed' ? 'failed' : 'success',
           failureReason ? String(failureReason).slice(0, 191) : null,
           eventType === 'register' ? 'register' : 'login',
+          method,
         ]
       );
     })
@@ -256,7 +285,7 @@ async function listLoginAttempts(req, res) {
       `SELECT
          la.id, la.user_id, la.user_name, la.identifier, la.device_name,
          la.platform, la.ip_address, la.status, la.failure_reason,
-         la.event_type, la.created_at,
+         la.event_type, la.login_method, la.created_at,
          u.first_name, u.last_name, u.email, u.phone
        ${fromSql}
        ORDER BY la.id DESC
@@ -280,6 +309,7 @@ async function listLoginAttempts(req, res) {
       status: r.status,
       failure_reason: r.failure_reason,
       event_type: r.event_type,
+      login_method: r.login_method || 'password',
       created_at: r.created_at,
     }));
 

@@ -6,7 +6,7 @@ const { assignReferralCode } = require('../utils/referralCode');
 
 // ── Invite-5 task target & one-time reward amount ─────────────────────────────
 const TASK_TARGET  = 5;
-const TASK_REWARD  = 500.00;
+const TASK_REWARD  = 300.00;
 
 // ── Referral bonus rate per plan type — applied to the FIRST month's
 //    payment only, credited once per referred user. ─────────────────────────
@@ -90,7 +90,7 @@ async function _runSchemaMigration() {
         sql: `ALTER TABLE users ADD COLUMN referral_task_progress INT UNSIGNED NOT NULL DEFAULT 0`,
       },
       {
-        // Guards the ₹500 "Invite 5 Users" reward so it can only be
+        // Guards the ₹300 "Invite 5 Users" reward so it can only be
         // claimed once.
         col: 'referral_reward_claimed',
         sql: `ALTER TABLE users ADD COLUMN referral_reward_claimed TINYINT(1) NOT NULL DEFAULT 0`,
@@ -121,7 +121,7 @@ async function _runSchemaMigration() {
 
     // ── referral_transactions ────────────────────────────────────────────
     // One row per credited event — either a per-referred-user bonus or the
-    // one-time ₹500 task reward. Powers the "Referral" tab in Transaction
+    // one-time ₹300 task reward. Powers the "Referral" tab in Transaction
     // History with the exact fields the app needs (referred user, plan,
     // first payment, bonus, date/time).
     await db.execute(`
@@ -190,7 +190,7 @@ async function getReferralInfo(req, res) {
 
     // Lifetime referral earnings — there is no separate Referral Wallet
     // anymore, so this is purely a display figure derived from the sum of
-    // every referral_transactions row (bonuses + the ₹500 task reward),
+    // every referral_transactions row (bonuses + the ₹300 task reward),
     // all of which have already been credited straight to users.balance
     // (the Main Wallet) at the time they were earned/claimed.
     const [[earningsRow]] = await db.execute(
@@ -214,7 +214,7 @@ async function getReferralInfo(req, res) {
 }
 
 // ── POST /api/referral/claim-reward ───────────────────────────────────────────
-// Claims the one-time ₹500 "Invite 5 Users" reward and credits it to the
+// Claims the one-time ₹300 "Invite 5 Users" reward and credits it to the
 // user's main Wallet Balance. Locked behind a row lock so a double-tap /
 // concurrent request can never claim it twice.
 async function claimReward(req, res) {
@@ -275,7 +275,7 @@ async function claimReward(req, res) {
     ).catch(e => console.error('[referral] claimReward notify error:', e.message));
 
     const newBalance = parseFloat(user.balance || 0) + TASK_REWARD;
-    return ok(res, 'Reward claimed! ₹500 added to your Wallet.', {
+    return ok(res, 'Reward claimed! ₹300 added to your Wallet.', {
       wallet_balance: newBalance,
       reward_claimed: true,
     });
