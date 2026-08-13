@@ -412,6 +412,10 @@ async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredi
     plan_type:         PLAN_MONTHS[plan.plan_type] || 6,
     monthly_amount:    Number(plan.monthly_amount),
     months_paid:       plan.months_paid,
+    // The exact moment the user submitted this plan/payment request (set
+    // once at INSERT time in enrollPlan and never touched again) — distinct
+    // from start_date, which is the later admin-approval-derived date.
+    submitted_at:      plan.created_at ? plan.created_at.toISOString() : null,
     start_date:        plan.start_date ? plan.start_date.toISOString() : null,
     maturity_date:     plan.maturity_date ? plan.maturity_date.toISOString() : null,
     last_payment_date: plan.last_payment_date ? plan.last_payment_date.toISOString() : null,
