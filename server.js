@@ -115,6 +115,15 @@ app.use('/api/push',           pushRoutes);
 // Health check
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+// API discovery/health endpoint. In production Nginx exposes this as
+// https://moneytries.com/v1/api, so opening the configured API prefix gives a
+// useful response instead of being mistaken for a missing deployment route.
+app.get('/api', (_req, res) => res.json({
+  success: true,
+  service: 'MoneyTries API',
+  status: 'ok',
+}));
+
 // 404 catch-all
 app.use((_req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 
@@ -160,7 +169,7 @@ async function start() {
   await ensurePlanSchema();     // investment_plans/roi_daily_credits/etc.
 
   app.listen(PORT, () => {
-    console.log(`🚀  GreenVault API running on http://localhost:${PORT}`);
+    console.log(`🚀  MoneyTries API running on http://localhost:${PORT}`);
     // Force Firebase Admin init (and its own success/warning log line —
     // see config/firebase.js) right at boot instead of lazily on the
     // first push, so a missing/bad FIREBASE_SERVICE_ACCOUNT_* is visible
