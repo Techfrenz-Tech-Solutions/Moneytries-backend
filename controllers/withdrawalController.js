@@ -393,7 +393,7 @@ async function listWithdrawals(req, res) {
   const pageNo   = Math.max(1, parseInt(req.body.pageNo   || req.query.pageNo   || '1',  10));
   const pageSize = Math.max(1, parseInt(req.body.pageSize || req.query.pageSize || '10', 10));
   const offset   = (pageNo - 1) * pageSize;
-  const { type, status } = req.body;
+  const { type, status, search } = req.body;
 
   let where = 'WHERE user_id = ?';
   const params = [userId];
@@ -405,6 +405,10 @@ async function listWithdrawals(req, res) {
   if (status && ['pending', 'approved', 'rejected'].includes(status)) {
     where += ' AND status = ?';
     params.push(status);
+  }
+  if (search && String(search).trim()) {
+    where += ' AND reference_id LIKE ?';
+    params.push(`%${String(search).trim()}%`);
   }
 
   try {
