@@ -495,15 +495,15 @@ async function sendSupportEmail(req, res) {
     // Gmail SMTP requires "from" to match the authenticated MAIL_USER account.
     // We display the user's identity in the subject/body/replyTo instead.
     await transporter.sendMail({
-      from:    `"GreenVault Support" <${process.env.MAIL_USER}>`,
+      from:    `"MoneyTries Support" <${process.env.MAIL_USER}>`,
       replyTo: `"${user.full_name}" <${user.email}>`,
       to:      supportTo,
-      subject: `[GreenVault Support] ${subject}`,
+      subject: `[MoneyTries Support] ${subject}`,
       text:    `From: ${user.full_name} (${user.email})\n\n${message}`,
       html: `
         <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
           <div style="background:#3D9E6A;padding:20px 24px;border-radius:8px 8px 0 0">
-            <h2 style="color:#fff;margin:0;font-size:18px">GreenVault — Support Request</h2>
+            <h2 style="color:#fff;margin:0;font-size:18px">MoneyTries — Support Request</h2>
           </div>
           <div style="background:#f9fafb;padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
             <p style="margin:0 0 8px 0;color:#374151"><strong>From:</strong> ${user.full_name} &lt;${user.email}&gt;</p>

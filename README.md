@@ -1,6 +1,6 @@
-# GreenVault — Auth Backend (Node.js + MySQL)
+# MoneyTries Backend (Node.js + MySQL)
 
-REST API for the **Login** and **Register** screens of the GreenVault Flutter app.
+REST API for the MoneyTries Flutter app.
 
 ---
 
@@ -38,7 +38,7 @@ Server starts at `http://localhost:3000`
 ## Project Structure
 
 ```
-greenvault-backend/
+moneytries-backend/
 ├── config/
 │   ├── db.js           ← MySQL connection pool (mysql2/promise)
 │   └── schema.sql      ← Run once to create DB + tables
