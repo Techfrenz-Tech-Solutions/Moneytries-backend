@@ -10,3 +10,7 @@ test('GET /api exposes the MoneyTries service discovery response', () => {
   assert.match(serverSource, /service:\s*'MoneyTries API'/);
   assert.match(serverSource, /status:\s*'ok'/);
 });
+
+test('push notification routes are mounted by the production server', () => {
+  assert.match(serverSource, /app\.use\('\/api\/push',\s*pushRoutes\)/);
+});
