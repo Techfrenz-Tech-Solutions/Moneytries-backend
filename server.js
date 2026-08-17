@@ -30,6 +30,7 @@ const db = require('./config/db');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '127.0.0.1';
 
 // Railway (and most PaaS hosts) put the app behind a reverse proxy, which
 // sets X-Forwarded-For. Express needs to be told to trust exactly one hop
@@ -39,8 +40,13 @@ app.set('trust proxy', 1);
 
 // ── Global middleware ─────────────────────────────────────────────────────────
 
+const allowedOrigins = (process.env.CORS_ORIGINS || '*')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
 app.use(cors({
-  origin: '*',
+  origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -168,8 +174,8 @@ async function start() {
   await ensureMemberIdSchema(); // users.member_id column + unique index
   await ensurePlanSchema();     // investment_plans/roi_daily_credits/etc.
 
-  app.listen(PORT, () => {
-    console.log(`🚀  MoneyTries API running on http://localhost:${PORT}`);
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`🚀  MoneyTries API running on http://${HOST}:${PORT}`);
     // Force Firebase Admin init (and its own success/warning log line —
     // see config/firebase.js) right at boot instead of lazily on the
     // first push, so a missing/bad FIREBASE_SERVICE_ACCOUNT_* is visible
@@ -178,6 +184,16 @@ async function start() {
     console.log(`[push] /api/push mounted — FCM ${pushConfigured ? 'configured' : 'NOT configured'}`);
     scheduleDailyRoi();
   });
+
+  function shutdown(signal) {
+    console.log(`[shutdown] ${signal} received; draining connections`);
+    server.close(() => {
+      db.end().finally(() => process.exit(0));
+    });
+  }
+
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 start().catch((err) => {

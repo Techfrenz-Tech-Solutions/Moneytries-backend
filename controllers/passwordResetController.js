@@ -4,6 +4,8 @@ const bcrypt = require('bcryptjs');
 const { validationResult } = require('express-validator');
 const db           = require('../config/db');
 const { ok, fail } = require('../utils/response');
+const { generateOtp, maskEmail } = require('../utils/otp');
+const { sendOtpEmail } = require('../services/emailService');
 
 const OTP_EXPIRY_MINUTES = 5;
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
@@ -39,10 +41,6 @@ async function ensurePasswordResetTable() {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
 
 function generateResetToken() {
   return crypto.randomBytes(32).toString('hex');
@@ -87,7 +85,7 @@ async function sendResetOtp(req, res) {
 
   try {
     const [users] = await db.execute(
-      `SELECT id FROM users WHERE ${column} = ? LIMIT 1`,
+      `SELECT id, email, first_name FROM users WHERE ${column} = ? LIMIT 1`,
       [value]
     );
 
@@ -106,21 +104,31 @@ async function sendResetOtp(req, res) {
     const otp       = generateOtp();
     const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
 
-    await db.execute(
+    const [insertResult] = await db.execute(
       `INSERT INTO password_reset_otps (user_id, identifier, otp, expires_at, verified, used)
        VALUES (?, ?, ?, ?, 0, 0)`,
       [userId, value, otp, expiresAt]
     );
 
-    // In production, integrate an SMS/email gateway here (e.g. Twilio, MSG91, SES).
-    console.log(`[forgot-password:send-otp] Identifier ${value} | OTP: ${otp}`);
+    try {
+      await sendOtpEmail({
+        to: users[0].email,
+        otp,
+        expiryMinutes: OTP_EXPIRY_MINUTES,
+        userName: users[0].first_name,
+        purpose: 'password-reset',
+      });
+    } catch (emailError) {
+      await db.execute('DELETE FROM password_reset_otps WHERE id = ?', [insertResult.insertId]);
+      console.error('[sendResetOtp] email delivery failed:', emailError.message);
+      return fail(res, 'We could not send the verification email. Please try again.', 502);
+    }
+
+    console.log(`[sendResetOtp] OTP email sent to ${maskEmail(users[0].email)}`);
 
     return ok(res, 'OTP sent successfully', {
       identifier: value,
       expires_in_seconds: OTP_EXPIRY_MINUTES * 60,
-      // Dev-mode only — Flutter uses this to verify without a real SMS/email
-      // gateway wired up. Remove this field once a provider is configured.
-      ...(process.env.NODE_ENV !== 'production' && { otp }),
     });
   } catch (err) {
     console.error('[sendResetOtp]', err);

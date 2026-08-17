@@ -16,6 +16,8 @@ const { clearTokensForUser, getTokensForUser, sendPushToTokens } = require('../u
 // Fire-and-forget by design (see recordLoginAttempt's own doc comment) — it
 // never affects the outcome of the auth request it's called from.
 const { recordLoginAttempt } = require('./loginAnalyticsController');
+const { generateOtp, maskEmail } = require('../utils/otp');
+const { sendOtpEmail } = require('../services/emailService');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 const LOGIN_OTP_EXPIRY_MINUTES = 5;
@@ -33,11 +35,6 @@ function safeUser(row) {
   return safe;
 }
 
-/** Generates a 6-digit numeric OTP. */
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
 /**
  * Masks a phone number for display on the "Enter OTP" screen, e.g.
  * "9876543210" -> "98••••••10". Never send the full number back to the
@@ -52,24 +49,33 @@ function maskPhone(phone) {
 
 /**
  * Generates a fresh 2FA login OTP for the given user, persists it, and
- * "sends" it (console log placeholder — swap in a real SMS gateway such as
- * Twilio/MSG91 in production, mirroring send2faOtp in securityController).
- * Returns the plaintext OTP only so the caller can optionally echo it back
- * in non-production responses for testing.
+ * sends it through the shared email service.
  */
-async function issueLoginOtp(userId) {
+async function issueLoginOtp(user) {
   const otp = generateOtp();
   const expiresAt = new Date(Date.now() + LOGIN_OTP_EXPIRY_MINUTES * 60 * 1000);
 
   await db.execute(
     'UPDATE users SET two_factor_otp = ?, two_factor_otp_expires_at = ? WHERE id = ?',
-    [otp, expiresAt, userId]
+    [otp, expiresAt, user.id]
   );
 
-  // In production, integrate an SMS gateway here (e.g. Twilio, MSG91).
-  console.log(`[login-2fa-otp] User ${userId} | OTP: ${otp}`);
-
-  return otp;
+  try {
+    await sendOtpEmail({
+      to: user.email,
+      otp,
+      expiryMinutes: LOGIN_OTP_EXPIRY_MINUTES,
+      userName: user.first_name,
+      purpose: 'two-factor-authentication',
+    });
+  } catch (error) {
+    await db.execute(
+      'UPDATE users SET two_factor_otp = NULL, two_factor_otp_expires_at = NULL WHERE id = ?',
+      [user.id]
+    );
+    throw error;
+  }
+  console.log(`[issueLoginOtp] OTP email sent to ${maskEmail(user.email)}`);
 }
 
 /**
@@ -460,17 +466,18 @@ async function login(req, res) {
     // ── 2FA branch ─────────────────────────────────────────────────────────
     // Identifier + password are correct, but this account has Two-Factor
     // Authentication turned on (Security Settings). Do NOT issue a full
-    // access token yet — send an OTP to the registered mobile number and
+    // access token yet — send an OTP to the registered email address and
     // hand back only a short-lived "pending" token that is good for
     // nothing except completing the OTP step below.
     if (user.two_factor_enabled === 1) {
-      await issueLoginOtp(user.id);
+      await issueLoginOtp(user);
       const pendingToken = signPendingToken(user.id);
 
-      return ok(res, 'OTP sent to your registered mobile number', {
+      return ok(res, 'OTP sent to your registered email address', {
         requires_2fa: true,
         pending_token: pendingToken,
         phone_hint: maskPhone(user.phone),
+        email_hint: maskEmail(user.email),
         expires_in_seconds: LOGIN_OTP_EXPIRY_MINUTES * 60,
       });
     }
@@ -507,7 +514,7 @@ async function resendLoginOtp(req, res) {
 
   try {
     const [rows] = await db.execute(
-      'SELECT id, phone FROM users WHERE id = ? LIMIT 1',
+      'SELECT id, email, first_name, phone FROM users WHERE id = ? LIMIT 1',
       [req.user.sub]
     );
 
@@ -515,10 +522,11 @@ async function resendLoginOtp(req, res) {
       return fail(res, 'User not found', 404);
     }
 
-    await issueLoginOtp(rows[0].id);
+    await issueLoginOtp(rows[0]);
 
-    return ok(res, 'A new OTP has been sent to your registered mobile number', {
+    return ok(res, 'A new OTP has been sent to your registered email address', {
       phone_hint: maskPhone(rows[0].phone),
+      email_hint: maskEmail(rows[0].email),
       expires_in_seconds: LOGIN_OTP_EXPIRY_MINUTES * 60,
     });
   } catch (err) {

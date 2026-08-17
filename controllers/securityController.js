@@ -8,6 +8,8 @@ const { createNotification, createNotificationSilent } = require('./notification
 // PIN-only unlocks the same way they count email/password logins — see
 // verifyLoginPin below.
 const { recordLoginAttempt } = require('./loginAnalyticsController');
+const { generateOtp, maskEmail } = require('../utils/otp');
+const { sendOtpEmail } = require('../services/emailService');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 
@@ -582,7 +584,7 @@ async function send2faOtp(req, res) {
 
   try {
     const [rows] = await db.execute(
-      'SELECT id, phone FROM users WHERE id = ? LIMIT 1',
+      'SELECT id, email, first_name FROM users WHERE id = ? LIMIT 1',
       [req.user.sub]
     );
 
@@ -591,7 +593,7 @@ async function send2faOtp(req, res) {
     }
 
     // Generate 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = generateOtp();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
     await db.execute(
@@ -599,13 +601,27 @@ async function send2faOtp(req, res) {
       [otp, expiresAt, req.user.sub]
     );
 
-    // In production, integrate an SMS gateway here (e.g. Twilio, MSG91)
-    // For now, log the OTP to console (remove in production)
-    console.log(`[2FA OTP] User ${req.user.sub} | OTP: ${otp}`);
+    try {
+      await sendOtpEmail({
+        to: rows[0].email,
+        otp,
+        expiryMinutes: 5,
+        userName: rows[0].first_name,
+        purpose: 'two-factor-authentication',
+      });
+    } catch (emailError) {
+      await db.execute(
+        'UPDATE users SET two_factor_otp = NULL, two_factor_otp_expires_at = NULL WHERE id = ?',
+        [req.user.sub]
+      );
+      console.error('[send2faOtp] email delivery failed:', emailError.message);
+      return fail(res, 'We could not send the verification email. Please try again.', 502);
+    }
 
-    return ok(res, 'OTP sent to your registered mobile number', {
-      // Return OTP in dev mode only — remove this in production
-      ...(process.env.NODE_ENV !== 'production' && { otp }),
+    console.log(`[send2faOtp] OTP email sent to ${maskEmail(rows[0].email)}`);
+
+    return ok(res, 'OTP sent to your registered email address', {
+      email_hint: maskEmail(rows[0].email),
     });
   } catch (err) {
     console.error('[send2faOtp]', err);

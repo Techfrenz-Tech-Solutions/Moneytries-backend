@@ -2,6 +2,7 @@
 const { validationResult } = require('express-validator');
 const db           = require('../config/db');
 const { ok, fail } = require('../utils/response');
+const { generateOtp } = require('../utils/otp');
 
 const OTP_EXPIRY_MINUTES = 5;
 
@@ -33,10 +34,6 @@ async function ensureMobileOtpTable() {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
 
 // ── POST /api/users/send_mob_otp_register ────────────────────────────────────
 // Generates a 6-digit OTP for the given mobile number, valid for 5 minutes.
@@ -80,14 +77,11 @@ async function sendMobOtpRegister(req, res) {
     );
 
     // In production, integrate an SMS gateway here (e.g. Twilio, MSG91).
-    console.log(`[send_mob_otp_register] Phone ${phone} | OTP: ${otp}`);
+    console.warn('[sendMobOtpRegister] SMS delivery provider is not configured');
 
     return ok(res, 'OTP sent to your mobile number', {
       phone,
       expires_in_seconds: OTP_EXPIRY_MINUTES * 60,
-      // Dev-mode only — Flutter uses this to verify without a real SMS gateway.
-      // Remove this field once an SMS provider is wired up in production.
-      ...(process.env.NODE_ENV !== 'production' && { otp }),
     });
   } catch (err) {
     console.error('[sendMobOtpRegister]', err);

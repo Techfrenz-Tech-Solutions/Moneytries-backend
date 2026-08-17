@@ -2,6 +2,8 @@
 const { validationResult } = require('express-validator');
 const db           = require('../config/db');
 const { ok, fail } = require('../utils/response');
+const { generateOtp, maskEmail } = require('../utils/otp');
+const { sendOtpEmail } = require('../services/emailService');
 
 const OTP_EXPIRY_MINUTES = 5;
 
@@ -33,10 +35,6 @@ async function ensureEmailOtpTable() {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
 
 function normalizeEmail(raw) {
   return (raw || '').trim().toLowerCase();
@@ -77,22 +75,25 @@ async function sendEmailOtpRegister(req, res) {
     const otp       = generateOtp();
     const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
 
-    await db.execute(
+    const [insertResult] = await db.execute(
       `INSERT INTO email_otp_verifications (email, otp, expires_at, verified)
        VALUES (?, ?, ?, 0)`,
       [email, otp, expiresAt]
     );
 
-    // In production, integrate an email gateway here (e.g. SES, SendGrid, SMTP).
-    console.log(`[send_email_otp_register] Email ${email} | OTP: ${otp}`);
+    try {
+      await sendOtpEmail({ to: email, otp, expiryMinutes: OTP_EXPIRY_MINUTES });
+    } catch (emailError) {
+      await db.execute('DELETE FROM email_otp_verifications WHERE id = ?', [insertResult.insertId]);
+      console.error('[sendEmailOtpRegister] email delivery failed:', emailError.message);
+      return fail(res, 'We could not send the verification email. Please try again.', 502);
+    }
+
+    console.log(`[sendEmailOtpRegister] OTP email sent to ${maskEmail(email)}`);
 
     return ok(res, 'OTP sent to your email address', {
       email,
       expires_in_seconds: OTP_EXPIRY_MINUTES * 60,
-      // Dev-mode only — Flutter uses this to verify without a real email
-      // gateway. Remove this field once an email provider is wired up in
-      // production.
-      ...(process.env.NODE_ENV !== 'production' && { otp }),
     });
   } catch (err) {
     console.error('[sendEmailOtpRegister]', err);

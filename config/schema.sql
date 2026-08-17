@@ -107,6 +107,36 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   CONSTRAINT fk_rt_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ── email_templates ──────────────────────────────────────────
+-- Runtime-owned email content. Application code may only select an active
+-- template by its unique key and replace the allowlisted {{PLACEHOLDERS}}.
+CREATE TABLE IF NOT EXISTS email_templates (
+  id            INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  template_key  VARCHAR(80)   NOT NULL,
+  subject       VARCHAR(255)  NOT NULL,
+  html_body     MEDIUMTEXT    NOT NULL,
+  text_body     TEXT          NOT NULL,
+  is_active     TINYINT(1)    NOT NULL DEFAULT 1,
+  created_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_email_template_key (template_key),
+  CONSTRAINT chk_email_template_active CHECK (is_active IN (0, 1))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Seed only when missing so database-managed edits are never overwritten by
+-- application restarts or schema re-runs.
+INSERT INTO email_templates (template_key, subject, html_body, text_body)
+SELECT
+  'otp_email',
+  '{{SUBJECT}}',
+  '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{{SUBJECT}}</title></head><body style="margin:0;padding:0;background:#eef1ec;font-family:Arial,sans-serif;color:#16351c"><div style="display:none;max-height:0;overflow:hidden">Your Moneytries code expires in {{EXPIRY_TIME}} minutes.</div><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1ec"><tr><td align="center" style="padding:28px 10px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;background:#fff;border-radius:22px;overflow:hidden"><tr><td align="center" style="padding:18px;background:#0b2412"><img src="cid:moneytries-logo" width="130" height="130" alt="Moneytries" style="display:block;border:0"></td></tr><tr><td align="center" style="padding:30px 28px 8px"><h1 style="margin:0;font-size:30px;line-height:38px;color:#16351c">Your verification code</h1></td></tr><tr><td style="padding:10px 40px;text-align:center;font-size:15px;line-height:24px;color:#5a6b56"><strong>{{GREETING}}</strong><br>Use the code below to {{ACTION}}.</td></tr><tr><td align="center" style="padding:20px 10px"><table role="presentation" cellpadding="0" cellspacing="0"><tr>{{OTP_DIGITS}}</tr></table></td></tr><tr><td align="center" style="padding:4px 30px 10px;font-size:14px;line-height:22px;color:#5a6b56">This code expires in <strong>{{EXPIRY_TIME}} minutes</strong>.</td></tr><tr><td align="center" style="padding:0 30px 22px;font-size:12px;color:#6d7c68">Requested for {{EMAIL}}</td></tr><tr><td style="padding:18px 28px;background:#f4f9f2;border-top:1px solid #d9ecd3;text-align:center;font-size:13px;line-height:20px;color:#456141">Never share this code with anyone. If you did not request it, you can safely ignore this email.</td></tr><tr><td align="center" style="padding:18px;background:#0b2412;color:#fff;font-size:12px">&copy; {{YEAR}} Moneytries &middot; Seed Today. Freedom Tomorrow.</td></tr></table></td></tr></table></body></html>',
+  '{{GREETING}}\n\nYour Moneytries verification code is: {{OTP}}\n\nThis code expires in {{EXPIRY_TIME}} minutes. It was requested for {{EMAIL}}.\n\nNever share this code. If you did not request it, ignore this email.'
+WHERE NOT EXISTS (
+  SELECT 1 FROM email_templates WHERE template_key = 'otp_email'
+);
+
 -- ── kyc_submissions ──────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS kyc_submissions (
   id                  INT UNSIGNED  NOT NULL AUTO_INCREMENT,
