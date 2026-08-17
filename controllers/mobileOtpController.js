@@ -3,6 +3,7 @@ const { validationResult } = require('express-validator');
 const db           = require('../config/db');
 const { ok, fail } = require('../utils/response');
 const { generateOtp } = require('../utils/otp');
+const { sendOtpSms } = require('../services/smsService');
 
 const OTP_EXPIRY_MINUTES = 5;
 
@@ -70,14 +71,23 @@ async function sendMobOtpRegister(req, res) {
     const otp       = generateOtp();
     const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
 
-    await db.execute(
+    const [insertResult] = await db.execute(
       `INSERT INTO mobile_otp_verifications (phone, otp, expires_at, verified)
        VALUES (?, ?, ?, 0)`,
       [phone, otp, expiresAt]
     );
 
-    // In production, integrate an SMS gateway here (e.g. Twilio, MSG91).
-    console.warn('[sendMobOtpRegister] SMS delivery provider is not configured');
+    try {
+      await sendOtpSms(phone, otp);
+    } catch (smsError) {
+      // Do not leave an unusable OTP behind when delivery fails.
+      await db.execute(
+        'DELETE FROM mobile_otp_verifications WHERE id = ?',
+        [insertResult.insertId]
+      );
+      console.error('[sendMobOtpRegister] SMS delivery failed:', smsError.message);
+      return fail(res, 'Failed to send OTP. Please try again.', 502);
+    }
 
     return ok(res, 'OTP sent to your mobile number', {
       phone,
