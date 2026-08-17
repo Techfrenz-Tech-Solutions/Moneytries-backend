@@ -25,6 +25,9 @@ const {
   getLoginPinChangeStatus,
   verifyCurrentLoginPin,
   updateLoginPin,
+  getForgotLoginPinStatus,
+  sendForgotLoginPinOtp,
+  verifyForgotLoginPinOtp,
   setWithdrawalPin,
   verifyWithdrawalPinRemote,
   getWithdrawalPinChangeStatus,
@@ -103,6 +106,16 @@ router.post('/pin/login/verify', verifyLoginPin);
 router.get('/pin/login/change/status', getLoginPinChangeStatus);
 router.post('/pin/login/change/verify', verifyCurrentLoginPin);
 router.post('/pin/login/change/update', updateLoginPin);
+
+// ── Login PIN → Forgot Login PIN (email OTP recovery) ───────────────────────
+// GET  /api/security/pin/login/forgot/status      — resume lock / resend cooldown
+// POST /api/security/pin/login/forgot/send-otp    — email OTP (also "Resend OTP")
+// POST /api/security/pin/login/forgot/verify-otp  — verify OTP; on success this
+//   opens the same verified window as /pin/login/change/verify, so
+//   /pin/login/change/update (above) is reused as-is for Set/Confirm New PIN.
+router.get('/pin/login/forgot/status', getForgotLoginPinStatus);
+router.post('/pin/login/forgot/send-otp', sendForgotLoginPinOtp);
+router.post('/pin/login/forgot/verify-otp', verifyForgotLoginPinOtp);
 
 // POST /api/security/pin/withdrawal          — set/change the Withdrawal PIN
 // POST /api/security/pin/withdrawal/verify   — verify an entered Withdrawal PIN

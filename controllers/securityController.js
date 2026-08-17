@@ -32,6 +32,19 @@ const WITHDRAWAL_PIN_CHANGE_MAX_ATTEMPTS = 5;
 const WITHDRAWAL_PIN_CHANGE_LOCK_MS = 5 * 60 * 1000;      // 5 minutes
 const WITHDRAWAL_PIN_CHANGE_VERIFIED_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
+// ── Forgot Login PIN (email OTP) policy ─────────────────────────────────────
+// Lets a user who is locked out of the app (forgot their Login PIN) recover
+// it via an OTP emailed to their registered address, then reuses the
+// existing Change Login PIN "step 2" endpoint (updateLoginPin) to set the
+// new PIN — a verified Forgot-PIN OTP opens the very same
+// login_pin_change_verified_until window that verifyCurrentLoginPin opens.
+const LOGIN_PIN_RESET_OTP_EXPIRY_MS = 5 * 60 * 1000;        // 5 minutes
+const LOGIN_PIN_RESET_MAX_VERIFY_ATTEMPTS = 5;              // wrong-OTP cap
+const LOGIN_PIN_RESET_VERIFY_LOCK_MS = 5 * 60 * 1000;       // 5-minute lockout after cap
+const LOGIN_PIN_RESET_RESEND_COOLDOWN_MS = 30 * 1000;       // 30s between sends ("Resend OTP")
+const LOGIN_PIN_RESET_SEND_WINDOW_MS = 15 * 60 * 1000;      // rate-limit window
+const LOGIN_PIN_RESET_MAX_SENDS_PER_WINDOW = 5;             // sends allowed per window
+
 // ── One-time migration ────────────────────────────────────────────────────────
 let _migrated = false;
 // In-flight promise guard. Without this, several requests arriving at once
@@ -189,6 +202,49 @@ async function _runSecurityColumnsMigration() {
         // reflected as 'on' everywhere else too.
         col: 'biometric_enabled',
         sql: `ALTER TABLE users ADD COLUMN biometric_enabled TINYINT(1) NOT NULL DEFAULT 0`,
+      },
+      {
+        // Forgot Login PIN: the 6-digit OTP most recently emailed to the
+        // account owner, and when it expires. Set by
+        // POST /api/security/pin/login/forgot/send-otp, checked and cleared
+        // by POST /api/security/pin/login/forgot/verify-otp.
+        col: 'login_pin_reset_otp',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_otp VARCHAR(10) DEFAULT NULL`,
+      },
+      {
+        col: 'login_pin_reset_otp_expires_at',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_otp_expires_at TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        // Consecutive incorrect OTP attempts against the current
+        // login_pin_reset_otp. Reset on a fresh OTP send, a successful
+        // verify, or once login_pin_reset_locked_until elapses.
+        col: 'login_pin_reset_otp_attempts',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_otp_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0`,
+      },
+      {
+        // Set once login_pin_reset_otp_attempts reaches the cap — blocks
+        // further OTP verify attempts (423) until it elapses.
+        col: 'login_pin_reset_locked_until',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_locked_until TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        // Rate limiting for POST /api/security/pin/login/forgot/send-otp so
+        // "Resend OTP" can't be used to spam the account owner's inbox:
+        // number of OTP sends within the current login_pin_reset_send_window_started_at
+        // window, capped at LOGIN_PIN_RESET_MAX_SENDS_PER_WINDOW.
+        col: 'login_pin_reset_send_count',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_send_count TINYINT UNSIGNED NOT NULL DEFAULT 0`,
+      },
+      {
+        col: 'login_pin_reset_send_window_started_at',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_send_window_started_at TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        // Timestamp of the last OTP send, enforced as a short per-request
+        // cooldown independent of the send-count window above.
+        col: 'login_pin_reset_last_sent_at',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_last_sent_at TIMESTAMP NULL DEFAULT NULL`,
       },
     ];
 
@@ -1287,6 +1343,274 @@ async function updateLoginPin(req, res) {
   }
 }
 
+// ── Forgot Login PIN → recover via email OTP ────────────────────────────────
+// For a user already authenticated by email/password (has a valid JWT) but
+// locked out of the app because they forgot their Login PIN. Three-step
+// flow, all server-enforced:
+//   1. POST /api/security/pin/login/forgot/send-otp    — email a 6-digit OTP
+//      to the account's registered address (also powers "Resend OTP")
+//   2. POST /api/security/pin/login/forgot/verify-otp  — verify it; success
+//      opens the same login_pin_change_verified_until window used by the
+//      existing Change Login PIN flow
+//   3. POST /api/security/pin/login/change/update       — (existing
+//      endpoint, unchanged) sets the new PIN using that verified window
+// GET /api/security/pin/login/forgot/status lets the app resume the correct
+// UI (locked countdown / resend cooldown) if it's reopened mid-lockout.
+
+function _maskEmail(email) {
+  const [user, domain] = String(email).split('@');
+  if (!domain) return email;
+  const visible = user.slice(0, Math.min(2, user.length));
+  return `${visible}${'*'.repeat(Math.max(user.length - visible.length, 1))}@${domain}`;
+}
+
+async function getForgotLoginPinStatus(req, res) {
+  await ensureSecurityColumns();
+  try {
+    const [rows] = await db.execute(
+      `SELECT email, login_pin_reset_locked_until, login_pin_reset_last_sent_at
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    const now = new Date();
+    const lockedUntil = user.login_pin_reset_locked_until
+      ? new Date(user.login_pin_reset_locked_until)
+      : null;
+    const lastSentAt = user.login_pin_reset_last_sent_at
+      ? new Date(user.login_pin_reset_last_sent_at)
+      : null;
+    const cooldownEndsAt = lastSentAt
+      ? new Date(lastSentAt.getTime() + LOGIN_PIN_RESET_RESEND_COOLDOWN_MS)
+      : null;
+
+    return ok(res, 'Forgot Login PIN status fetched', {
+      email: user.email ? _maskEmail(user.email) : null,
+      locked: !!(lockedUntil && lockedUntil > now),
+      locked_remaining_seconds:
+        lockedUntil && lockedUntil > now ? Math.ceil((lockedUntil - now) / 1000) : 0,
+      resend_cooldown_seconds:
+        cooldownEndsAt && cooldownEndsAt > now
+          ? Math.ceil((cooldownEndsAt - now) / 1000)
+          : 0,
+    });
+  } catch (err) {
+    console.error('[getForgotLoginPinStatus]', err);
+    return fail(res, 'Failed to fetch status.', 500);
+  }
+}
+
+async function sendForgotLoginPinOtp(req, res) {
+  await ensureSecurityColumns();
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, email, login_pin_reset_locked_until, login_pin_reset_last_sent_at,
+              login_pin_reset_send_count, login_pin_reset_send_window_started_at
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    if (!user.email) {
+      return fail(res, 'No registered email address on this account. Please contact support.', 400);
+    }
+
+    const now = new Date();
+
+    // Still locked out from too many wrong-OTP attempts on a previous code.
+    const lockedUntil = user.login_pin_reset_locked_until
+      ? new Date(user.login_pin_reset_locked_until)
+      : null;
+    if (lockedUntil && lockedUntil > now) {
+      return res.status(423).json({
+        success: false,
+        message: 'Too many incorrect attempts. Please try again later.',
+        data: { locked: true, remaining_seconds: Math.ceil((lockedUntil - now) / 1000) },
+      });
+    }
+
+    // Short cooldown between sends so "Resend OTP" can't be spammed.
+    const lastSentAt = user.login_pin_reset_last_sent_at
+      ? new Date(user.login_pin_reset_last_sent_at)
+      : null;
+    if (lastSentAt) {
+      const cooldownEndsAt = new Date(lastSentAt.getTime() + LOGIN_PIN_RESET_RESEND_COOLDOWN_MS);
+      if (cooldownEndsAt > now) {
+        return res.status(429).json({
+          success: false,
+          message: 'Please wait before requesting another OTP.',
+          data: { retry_after_seconds: Math.ceil((cooldownEndsAt - now) / 1000) },
+        });
+      }
+    }
+
+    // Rolling rate-limit window: cap total sends per window to stop abuse.
+    const windowStartedAt = user.login_pin_reset_send_window_started_at
+      ? new Date(user.login_pin_reset_send_window_started_at)
+      : null;
+    const windowExpired =
+      !windowStartedAt || now.getTime() - windowStartedAt.getTime() > LOGIN_PIN_RESET_SEND_WINDOW_MS;
+
+    let sendCount = windowExpired ? 0 : (user.login_pin_reset_send_count || 0);
+    const newWindowStartedAt = windowExpired ? now : windowStartedAt;
+
+    if (sendCount >= LOGIN_PIN_RESET_MAX_SENDS_PER_WINDOW) {
+      const windowEndsAt = new Date(
+        newWindowStartedAt.getTime() + LOGIN_PIN_RESET_SEND_WINDOW_MS
+      );
+      return res.status(429).json({
+        success: false,
+        message: 'Too many OTP requests. Please try again later.',
+        data: { retry_after_seconds: Math.ceil((windowEndsAt - now) / 1000) },
+      });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + LOGIN_PIN_RESET_OTP_EXPIRY_MS);
+
+    await db.execute(
+      `UPDATE users
+         SET login_pin_reset_otp = ?,
+             login_pin_reset_otp_expires_at = ?,
+             login_pin_reset_otp_attempts = 0,
+             login_pin_reset_locked_until = NULL,
+             login_pin_reset_last_sent_at = ?,
+             login_pin_reset_send_count = ?,
+             login_pin_reset_send_window_started_at = ?
+         WHERE id = ?`,
+      [otp, expiresAt, now, sendCount + 1, newWindowStartedAt, user.id]
+    );
+
+    // In production, integrate an email gateway here (e.g. SES, SendGrid, SMTP).
+    console.log(`[forgot-login-pin:send-otp] User ${user.id} <${user.email}> | OTP: ${otp}`);
+
+    return ok(res, 'OTP sent to your registered email address', {
+      email: _maskEmail(user.email),
+      expires_in_seconds: Math.ceil(LOGIN_PIN_RESET_OTP_EXPIRY_MS / 1000),
+      // Dev-mode only — remove this field once an email provider is wired up.
+      ...(process.env.NODE_ENV !== 'production' && { otp }),
+    });
+  } catch (err) {
+    console.error('[sendForgotLoginPinOtp]', err);
+    return fail(res, 'Failed to send OTP. Please try again.', 500);
+  }
+}
+
+async function verifyForgotLoginPinOtp(req, res) {
+  await ensureSecurityColumns();
+  const { otp } = req.body;
+  if (!otp || typeof otp !== 'string' || otp.length !== 6) {
+    return fail(res, 'Please provide a valid 6-digit OTP', 400);
+  }
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, login_pin_reset_otp, login_pin_reset_otp_expires_at,
+              login_pin_reset_otp_attempts, login_pin_reset_locked_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+
+    const user = rows[0];
+    const now = new Date();
+
+    const lockedUntil = user.login_pin_reset_locked_until
+      ? new Date(user.login_pin_reset_locked_until)
+      : null;
+    if (lockedUntil && lockedUntil > now) {
+      return res.status(423).json({
+        success: false,
+        message: 'Too many incorrect attempts. Please try again later.',
+        data: { locked: true, remaining_seconds: Math.ceil((lockedUntil - now) / 1000) },
+      });
+    }
+
+    if (!user.login_pin_reset_otp) {
+      return fail(res, 'No OTP was requested. Please request a new OTP.', 400);
+    }
+
+    if (!user.login_pin_reset_otp_expires_at || now > new Date(user.login_pin_reset_otp_expires_at)) {
+      await db.execute(
+        `UPDATE users
+           SET login_pin_reset_otp = NULL, login_pin_reset_otp_expires_at = NULL
+           WHERE id = ?`,
+        [user.id]
+      );
+      return fail(res, 'OTP has expired. Please request a new one.', 400);
+    }
+
+    if (user.login_pin_reset_otp !== otp) {
+      const attempts = (user.login_pin_reset_otp_attempts || 0) + 1;
+
+      if (attempts >= LOGIN_PIN_RESET_MAX_VERIFY_ATTEMPTS) {
+        const newLockedUntil = new Date(Date.now() + LOGIN_PIN_RESET_VERIFY_LOCK_MS);
+        await db.execute(
+          `UPDATE users
+             SET login_pin_reset_otp = NULL,
+                 login_pin_reset_otp_expires_at = NULL,
+                 login_pin_reset_otp_attempts = 0,
+                 login_pin_reset_locked_until = ?
+             WHERE id = ?`,
+          [newLockedUntil, user.id]
+        );
+        return res.status(423).json({
+          success: false,
+          message: 'Too many incorrect attempts. Please request a new OTP after 5 minutes.',
+          data: { locked: true, remaining_seconds: Math.ceil(LOGIN_PIN_RESET_VERIFY_LOCK_MS / 1000) },
+        });
+      }
+
+      await db.execute(
+        'UPDATE users SET login_pin_reset_otp_attempts = ? WHERE id = ?',
+        [attempts, user.id]
+      );
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid OTP. Please try again.',
+        data: { remaining_attempts: LOGIN_PIN_RESET_MAX_VERIFY_ATTEMPTS - attempts },
+      });
+    }
+
+    // Correct OTP — clear the reset OTP state and open the same
+    // "verified" window the existing Change Login PIN step 1
+    // (verifyCurrentLoginPin) opens, so the existing
+    // POST /api/security/pin/login/change/update endpoint can be reused
+    // unchanged for "Set New PIN" / "Confirm New PIN".
+    const verifiedUntil = new Date(Date.now() + LOGIN_PIN_CHANGE_VERIFIED_WINDOW_MS);
+    await db.execute(
+      `UPDATE users
+         SET login_pin_reset_otp = NULL,
+             login_pin_reset_otp_expires_at = NULL,
+             login_pin_reset_otp_attempts = 0,
+             login_pin_reset_locked_until = NULL,
+             login_pin_reset_send_count = 0,
+             login_pin_reset_send_window_started_at = NULL,
+             login_pin_change_failed_attempts = 0,
+             login_pin_change_locked_until = NULL,
+             login_pin_change_verified_until = ?
+         WHERE id = ?`,
+      [verifiedUntil, user.id]
+    );
+
+    createNotification(
+      user.id, 'system', 'Login PIN Reset Requested',
+      'Your Login PIN reset was verified via email OTP. If this wasn\'t you, please contact support immediately.'
+    ).catch(e => console.error('[verifyForgotLoginPinOtp] notify error:', e.message));
+
+    return ok(res, 'OTP verified successfully', {
+      verified: true,
+      verified_window_seconds: Math.ceil(LOGIN_PIN_CHANGE_VERIFIED_WINDOW_MS / 1000),
+    });
+  } catch (err) {
+    console.error('[verifyForgotLoginPinOtp]', err);
+    return fail(res, 'Failed to verify OTP. Please try again.', 500);
+  }
+}
+
 async function setWithdrawalPin(req, res) {
   await ensureSecurityColumns();
   const { current_pin, new_pin } = req.body;
@@ -1616,6 +1940,9 @@ module.exports = {
   getLoginPinChangeStatus,
   verifyCurrentLoginPin,
   updateLoginPin,
+  getForgotLoginPinStatus,
+  sendForgotLoginPinOtp,
+  verifyForgotLoginPinOtp,
   setWithdrawalPin,
   verifyWithdrawalPinRemote,
   getWithdrawalPinChangeStatus,
