@@ -11,12 +11,14 @@ const TASK_REWARD  = 300.00;
 // ── Referral bonus rate per plan type — applied to the FIRST month's
 //    payment only, credited once per referred user. ─────────────────────────
 const REFERRAL_BONUS_RATES = {
+  'pre_plan': 0.0020, // 0.20%
   '3_month':  0.0030, // 0.30%
   '6_month':  0.0035, // 0.35%
   '12_month': 0.0045, // 0.45%
 };
 
 const PLAN_LABELS = {
+  'pre_plan': 'Pre Plan',
   '3_month':  '3 Month Plan',
   '6_month':  '6 Month Plan',
   '12_month': '12 Month Plan',
@@ -25,6 +27,7 @@ const PLAN_LABELS = {
 // Reverse lookup — turns the stored label ("3 Month Plan") back into the
 // short code the "Referral Candidates" tab displays (e.g. "3M").
 const PLAN_LABEL_TO_SHORT_CODE = {
+  'Pre Plan':      'PRE',
   '3 Month Plan':  '3M',
   '6 Month Plan':  '6M',
   '12 Month Plan': '12M',
@@ -42,6 +45,7 @@ function planLabelToShortCode(label) {
 // Turns the raw investment_plans.plan_type enum value ("3_month") into the
 // short code the "Referral Candidates" tab displays ("3M").
 const PLAN_TYPE_TO_SHORT_CODE = {
+  'pre_plan': 'PRE',
   '3_month':  '3M',
   '6_month':  '6M',
   '12_month': '12M',

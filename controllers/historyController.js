@@ -22,8 +22,8 @@ const { ok, fail } = require('../utils/response');
 
 const ROI_RATES = {
   '3_month':  0.0030,
-  '6_month':  0.0035,
-  '12_month': 0.0045,
+  '6_month':  0.0040,
+  '12_month': 0.0050,
 };
 
 const PLAN_MONTHS = {
@@ -31,6 +31,20 @@ const PLAN_MONTHS = {
   '6_month':  6,
   '12_month': 12,
 };
+
+// Pre Plan has no month count (day-based, 3–80 user-chosen days), so it
+// needs its own label lookup rather than the `${months} Month Plan`
+// formula used everywhere below.
+function planTypeLabel(planType) {
+  if (planType === 'pre_plan') return 'Pre Plan';
+  const months = PLAN_MONTHS[planType];
+  return months ? `${months} Month Plan` : 'Investment Plan';
+}
+function planTypeShortName(planType) {
+  if (planType === 'pre_plan') return 'Pre Plan';
+  const months = PLAN_MONTHS[planType];
+  return months ? `${months}M Investment Plan` : 'Investment Plan';
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -85,9 +99,8 @@ function buildRoiWithdrawalEvents(plans, planMap, roiWithdrawalRows) {
 
   for (const plan of plans) {
     const allRows    = rowsByPlan[plan.id] || [];
-    const planMonths = PLAN_MONTHS[plan.plan_type];
-    const planName   = `${planMonths}M Investment Plan`;
-    const planLabel  = `${planMonths} Month Plan`;
+    const planName   = planTypeShortName(plan.plan_type);
+    const planLabel  = planTypeLabel(plan.plan_type);
 
     // Separate real rows from legacy migration rows
     const realRows   = allRows.filter(w => !w.is_legacy && Number(w.amount) > 0);
@@ -183,9 +196,8 @@ function buildDailyRoiCreditEvents(planMap, dailyCreditRows) {
   for (const row of dailyCreditRows) {
     const plan = planMap[row.plan_id];
     if (!plan) continue;
-    const planMonths = PLAN_MONTHS[plan.plan_type];
-    const planLabel  = planMonths ? `${planMonths} Month Plan` : 'Investment Plan';
-    const planName   = planMonths ? `${planMonths}M Investment Plan` : 'Investment Plan';
+    const planLabel  = planTypeLabel(plan.plan_type);
+    const planName   = planTypeShortName(plan.plan_type);
     const creditDate = row.credit_date instanceof Date
       ? row.credit_date.toISOString().slice(0, 10)
       : String(row.credit_date).slice(0, 10);
@@ -222,9 +234,8 @@ function buildPrincipalCreditEvents(planMap, principalCreditRows) {
   for (const row of principalCreditRows) {
     const plan = planMap[row.plan_id];
     if (!plan) continue;
-    const planMonths = PLAN_MONTHS[plan.plan_type];
-    const planLabel  = planMonths ? `${planMonths} Month Plan` : 'Investment Plan';
-    const planName   = planMonths ? `${planMonths}M Investment Plan` : 'Investment Plan';
+    const planLabel  = planTypeLabel(plan.plan_type);
+    const planName   = planTypeShortName(plan.plan_type);
 
     events.push({
       id:        `principal_${row.id}`,
