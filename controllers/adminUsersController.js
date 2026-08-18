@@ -74,6 +74,7 @@ ensureAccountStatusColumn();
 /** '3_month' -> '3 Month', '12_month' -> '12 Month' */
 function formatPlanType(planType) {
   if (!planType) return null;
+  if (planType === 'pre_plan') return 'Pre Plan';
   const months = String(planType).split('_')[0];
   return `${months} Month`;
 }

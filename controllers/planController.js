@@ -6,9 +6,10 @@ const { createNotification, createNotificationAt } = require('./notificationCont
 
 // ── ROI rates per plan type ───────────────────────────────────────────────────
 const ROI_RATES = {
+  'pre_plan': 0.0020, // 0.20% daily
   '3_month':  0.0030, // 0.30% daily
-  '6_month':  0.0035, // 0.35% daily
-  '12_month': 0.0045, // 0.45% daily
+  '6_month':  0.0040, // 0.40% daily
+  '12_month': 0.0050, // 0.50% daily
 };
 
 const PLAN_MONTHS = {
@@ -16,6 +17,13 @@ const PLAN_MONTHS = {
   '6_month':  6,
   '12_month': 12,
 };
+
+// Pre Plan has no fixed month count — the user chooses a duration in days
+// (3–80) at enrollment, stored per-plan in investment_plans.duration_days.
+// This fallback is only used if that column is somehow missing/null.
+const PRE_PLAN_DEFAULT_DAYS = 30;
+const PRE_PLAN_MIN_DAYS = 3;
+const PRE_PLAN_MAX_DAYS = 80;
 
 // ── Business rule: min / max single-transaction investment amount ─────────────
 // No single investment plan's one-time invested amount may be below ₹500 or
@@ -32,6 +40,7 @@ const MAX_AMOUNT_MESSAGE = 'The maximum allowed deposit or plan amount is ₹100
 
 // Human-readable plan name used in ROI notification text, e.g. "3 Month Plan".
 function planDisplayName(planType) {
+  if (planType === 'pre_plan') return 'Pre Plan';
   const months = PLAN_MONTHS[planType];
   return months ? `${months} Month Plan` : 'Investment Plan';
 }
@@ -77,9 +86,10 @@ async function _runSchemaMigration() {
       CREATE TABLE IF NOT EXISTS investment_plans (
         id                INT UNSIGNED NOT NULL AUTO_INCREMENT,
         user_id           INT UNSIGNED NOT NULL,
-        plan_type         ENUM('3_month','6_month','12_month') NOT NULL,
+        plan_type         ENUM('pre_plan','3_month','6_month','12_month') NOT NULL,
         monthly_amount    DECIMAL(15,2) NOT NULL,
         months_paid       INT UNSIGNED NOT NULL DEFAULT 0,
+        duration_days     INT UNSIGNED DEFAULT NULL,
         start_date        DATE DEFAULT NULL,
         maturity_date     DATE DEFAULT NULL,
         last_payment_date DATE DEFAULT NULL,
@@ -103,6 +113,19 @@ async function _runSchemaMigration() {
     try {
       await db.execute(`ALTER TABLE investment_plans ADD COLUMN last_roi_date DATE DEFAULT NULL`);
       console.log('[plan] ✅  Added last_roi_date column.');
+    } catch (_) { /* already exists — ignore */ }
+
+    // Safe migration: extend plan_type enum with 'pre_plan' for pre-existing
+    // installs (a brand-new CREATE TABLE above already includes it). Also add
+    // duration_days, which only Pre Plan uses (3–80 user-chosen days) since
+    // every other plan type has a fixed month-based duration.
+    try {
+      await db.execute(`ALTER TABLE investment_plans MODIFY COLUMN plan_type ENUM('pre_plan','3_month','6_month','12_month') NOT NULL`);
+      console.log('[plan] ✅  Extended plan_type enum with pre_plan.');
+    } catch (_) { /* already extended — ignore */ }
+    try {
+      await db.execute(`ALTER TABLE investment_plans ADD COLUMN duration_days INT UNSIGNED DEFAULT NULL`);
+      console.log('[plan] ✅  Added duration_days column.');
     } catch (_) { /* already exists — ignore */ }
 
     await db.execute(`
@@ -323,6 +346,7 @@ async function _runSchemaMigration() {
 function normalisePlanType(raw) {
   if (!raw) return null;
   const s = raw.toString().toLowerCase().replace(/[^0-9a-z_]/g, '');
+  if (s === 'pre_plan' || s === 'preplan' || s === 'pre') return 'pre_plan';
   if (s === '3' || s === '3_month') return '3_month';
   if (s === '6' || s === '6_month') return '6_month';
   if (s === '12' || s === '12_month') return '12_month';
@@ -344,6 +368,29 @@ function addMonthsToDateStr(ymd, n) {
   const lastDayOfMonth = new Date(Date.UTC(newYear, newMonth, 0)).getUTCDate();
   const newDay = Math.min(d, lastDayOfMonth);
   return `${newYear}-${String(newMonth).padStart(2, '0')}-${String(newDay).padStart(2, '0')}`;
+}
+
+// Adds `n` calendar days to a 'YYYY-MM-DD' string and returns a new
+// 'YYYY-MM-DD' string. Pure UTC-midnight math — same timezone-safety
+// rationale as addMonthsToDateStr() above. Used for Pre Plan, whose
+// duration is a plain day count (3–80) rather than calendar months.
+function addDaysToDateStr(ymd, days) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d) + days * 24 * 60 * 60 * 1000);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+// Single source of truth for "maturity date from start date" across
+// enrollment approval, per-instalment approval, and the fix-dates repair
+// utility — Pre Plan uses its stored duration_days (day-based), every other
+// plan type uses the fixed PLAN_MONTHS calendar-month duration.
+function computeMaturityDateStr(startDateStr, planType, durationDays) {
+  if (planType === 'pre_plan') {
+    const days = Number(durationDays);
+    const safeDays = Number.isFinite(days) && days > 0 ? days : PRE_PLAN_DEFAULT_DAYS;
+    return addDaysToDateStr(startDateStr, safeDays);
+  }
+  return addMonthsToDateStr(startDateStr, PLAN_MONTHS[planType] || 6);
 }
 
 // Normalises any Date/string into a 'YYYY-MM-DD' string using the value's own
@@ -409,7 +456,13 @@ async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredi
 
   return {
     id:                String(plan.id),
-    plan_type:         PLAN_MONTHS[plan.plan_type] || 6,
+    plan_type:         plan.plan_type === 'pre_plan' ? 'pre_plan' : (PLAN_MONTHS[plan.plan_type] || 6),
+    // Only meaningful (non-null) for Pre Plan — the user-chosen 3–80 day
+    // duration. Every other plan type has a fixed, month-derived duration
+    // the client already knows from `plan_type`.
+    duration_days:     plan.plan_type === 'pre_plan'
+      ? (plan.duration_days != null ? Number(plan.duration_days) : null)
+      : null,
     monthly_amount:    Number(plan.monthly_amount),
     months_paid:       plan.months_paid,
     // The exact moment the user submitted this plan/payment request (set
@@ -571,7 +624,18 @@ async function enrollPlan(req, res) {
   }
 
   const planType = normalisePlanType(rawType);
-  if (!planType) return fail(res, 'Invalid plan_type. Use 3, 6, or 12.', 422);
+  if (!planType) return fail(res, 'Invalid plan_type. Use pre_plan, 3, 6, or 12.', 422);
+
+  // Pre Plan has no fixed duration — the user must supply how many days
+  // (3–80) to run it for. Every other plan type ignores duration_days
+  // entirely (their duration is fixed by plan_type).
+  let durationDays = null;
+  if (planType === 'pre_plan') {
+    durationDays = Number(req.body.duration_days);
+    if (!Number.isInteger(durationDays) || durationDays < PRE_PLAN_MIN_DAYS || durationDays > PRE_PLAN_MAX_DAYS) {
+      return fail(res, `Invalid duration_days for Pre Plan. Must be a whole number between ${PRE_PLAN_MIN_DAYS} and ${PRE_PLAN_MAX_DAYS}.`, 422);
+    }
+  }
 
   const amount = Number(monthly_amount);
   if (!amount || amount <= 0) return fail(res, 'Invalid monthly_amount.', 422);
@@ -628,9 +692,9 @@ async function enrollPlan(req, res) {
     const isFirstEverPlan = priorPlanCount === 0;
 
     const [insertRes] = await conn.execute(
-      `INSERT INTO investment_plans (user_id, plan_type, monthly_amount, months_paid, status)
-       VALUES (?, ?, ?, 0, 'under_review')`,
-      [userId, planType, amount]
+      `INSERT INTO investment_plans (user_id, plan_type, monthly_amount, months_paid, duration_days, status)
+       VALUES (?, ?, ?, 0, ?, 'under_review')`,
+      [userId, planType, amount, durationDays]
     );
     const planId = insertRes.insertId;
 
@@ -646,7 +710,7 @@ async function enrollPlan(req, res) {
       userId,
       'plan',
       'Investment Plan Submitted',
-      `Your ${planType.replace('_', '-')} investment plan enrollment (one-time payment of ₹${amount.toLocaleString('en-IN')}) has been submitted and is under review by admin.`
+      `Your ${planDisplayName(planType)} enrollment (one-time payment of ₹${amount.toLocaleString('en-IN')}) has been submitted and is under review by admin.`
     ).catch(e => console.error('[plan:enroll] notify error:', e.message));
 
     if (isFirstEverPlan) {
@@ -932,7 +996,7 @@ async function adminApprovePlan(req, res) {
     const startDate = firstIns ? dateStr(firstIns.created_at) : todayStr();
 
     const totalMonths = PLAN_MONTHS[plan.plan_type];
-    const maturityDate = addMonthsToDateStr(startDate, totalMonths);
+    const maturityDate = computeMaturityDateStr(startDate, plan.plan_type, plan.duration_days);
 
     // NOTE: last_roi_date is intentionally left NULL here (not = startDate).
     // No ROI has actually been credited yet — accrueRoiForPlan() below will
@@ -988,7 +1052,7 @@ async function adminApprovePlan(req, res) {
       plan.user_id,
       'plan',
       'Investment Plan Approved',
-      `Your ${plan.plan_type.replace('_', '-')} investment plan has been approved and is now active.`
+      `Your ${planDisplayName(plan.plan_type)} has been approved and is now active.`
     ).catch(e => console.error('[plan:approve] notify error:', e.message));
 
     // Credit ROI from the start date through today (inclusive, idempotent).
@@ -1106,7 +1170,7 @@ async function adminApproveInstalment(req, res) {
     let startDateParams = [];
     if (!plan.start_date) {
       const startDate    = dateStr(ins.created_at);
-      const maturityDate = addMonthsToDateStr(startDate, totalMonths);
+      const maturityDate = computeMaturityDateStr(startDate, plan.plan_type, plan.duration_days);
       startDateUpdate = `, start_date = ?, maturity_date = ?`;
       startDateParams = [startDate, maturityDate];
     }
@@ -1253,7 +1317,7 @@ async function adminFixPlanDates(req, res) {
   await ensureSchema();
   try {
     const [plans] = await db.execute(
-      `SELECT ip.id, ip.plan_type, ip.start_date, ip.maturity_date,
+      `SELECT ip.id, ip.plan_type, ip.start_date, ip.maturity_date, ip.duration_days,
               pi.created_at AS first_payment_at
          FROM investment_plans ip
          JOIN plan_instalments pi ON pi.plan_id = ip.id AND pi.month_number = 1
@@ -1267,8 +1331,7 @@ async function adminFixPlanDates(req, res) {
       const correctStartDate = dateStr(row.first_payment_at);
       const currentStartDate = row.start_date ? dateStr(row.start_date) : null;
 
-      const totalMonths = PLAN_MONTHS[row.plan_type];
-      const correctMaturity = addMonthsToDateStr(correctStartDate, totalMonths);
+      const correctMaturity = computeMaturityDateStr(correctStartDate, row.plan_type, row.duration_days);
       const currentMaturity = row.maturity_date ? dateStr(row.maturity_date) : null;
 
       if (currentStartDate === correctStartDate && currentMaturity === correctMaturity) {

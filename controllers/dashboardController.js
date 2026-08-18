@@ -55,7 +55,7 @@ function pctDelta(current, previous) {
 }
 
 function planLabel(planType) {
-  const map = { '3_month': '3-Month Plan', '6_month': '6-Month Plan', '12_month': '12-Month Plan' };
+  const map = { 'pre_plan': 'Pre Plan', '3_month': '3-Month Plan', '6_month': '6-Month Plan', '12_month': '12-Month Plan' };
   return map[planType] || planType;
 }
 
@@ -243,7 +243,7 @@ async function getDashboardSummary(_req, res) {
     const planDistRows = await safeQuery(
       `SELECT plan_type, COUNT(*) c FROM investment_plans WHERE status IN ('approved','active') GROUP BY plan_type`, [], []
     );
-    const PLAN_COLORS = { '3_month': 'var(--blue-400)', '6_month': 'var(--em-600)', '12_month': 'var(--gold-400)' };
+    const PLAN_COLORS = { 'pre_plan': 'var(--gray-400)', '3_month': 'var(--blue-400)', '6_month': 'var(--em-600)', '12_month': 'var(--gold-400)' };
     const planDistribution = planDistRows.map((r) => ({
       label: planLabel(r.plan_type),
       value: Number(r.c) || 0,
@@ -255,7 +255,7 @@ async function getDashboardSummary(_req, res) {
       `SELECT plan_type, COUNT(*) subscribers, COALESCE(SUM(plan_amount),0) aum
          FROM investment_plans WHERE status IN ('approved','active','completed') GROUP BY plan_type`, [], []
     );
-    const PLAN_ROI_LABEL = { '3_month': '0.30%/day', '6_month': '0.35%/day', '12_month': '0.45%/day' };
+    const PLAN_ROI_LABEL = { 'pre_plan': '0.20%/day', '3_month': '0.30%/day', '6_month': '0.40%/day', '12_month': '0.50%/day' };
     const totalAumForShare = topPlanRows.reduce((sum, r) => sum + (Number(r.aum) || 0), 0);
     const topPlans = topPlanRows
       .map((r, i) => {
