@@ -10,6 +10,7 @@ const { createNotification, createNotificationSilent } = require('./notification
 const { recordLoginAttempt } = require('./loginAnalyticsController');
 const { generateOtp, maskEmail } = require('../utils/otp');
 const { sendOtpEmail } = require('../services/emailService');
+const { sendOtpSms } = require('../services/smsService');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 
@@ -205,6 +206,15 @@ async function _runSecurityColumnsMigration() {
         // cooldown independent of the send-count window above.
         col: 'login_pin_reset_last_sent_at',
         sql: `ALTER TABLE users ADD COLUMN login_pin_reset_last_sent_at TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        // Which channel the most recently-issued login_pin_reset_otp was
+        // delivered through — 'email' or 'sms'. Shares the same OTP value,
+        // expiry, attempt counter, lock, cooldown and send-window as email
+        // OTP (see LOGIN_PIN_RESET_* policy above), so switching channels
+        // does not grant extra attempts or bypass the abuse limits.
+        col: 'login_pin_reset_channel',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_channel VARCHAR(10) DEFAULT NULL`,
       },
     ];
 
@@ -732,37 +742,6 @@ async function get2faStatus(req, res) {
   }
 }
 
-// ── GET /api/security/sessions ───────────────────────────────────────────────
-
-async function getSessions(req, res) {
-  await ensureSecurityColumns();
-
-  try {
-    const [rows] = await db.execute(
-      `SELECT id, device_name, device_type, location, last_active, is_current
-         FROM user_sessions
-         WHERE user_id = ?
-         ORDER BY is_current DESC, last_active DESC
-         LIMIT 20`,
-      [req.user.sub]
-    );
-
-    const sessions = rows.map(r => ({
-      id:          r.id.toString(),
-      device_name: r.device_name,
-      device_type: r.device_type,
-      location:    r.location,
-      last_active: _formatLastActive(r.last_active),
-      is_current:  r.is_current === 1,
-    }));
-
-    return ok(res, 'Sessions fetched', { sessions });
-  } catch (err) {
-    console.error('[getSessions]', err);
-    return fail(res, 'Failed to fetch sessions.', 500);
-  }
-}
-
 // ── POST /api/security/sessions/register ────────────────────────────────────
 // Called after a successful login from the app to register/update the session.
 
@@ -807,39 +786,6 @@ async function registerSession(req, res) {
   } catch (err) {
     console.error('[registerSession]', err);
     return fail(res, 'Failed to register session.', 500);
-  }
-}
-
-// ── DELETE /api/security/sessions/:sessionId ─────────────────────────────────
-
-async function revokeSession(req, res) {
-  await ensureSecurityColumns();
-
-  const { sessionId } = req.params;
-
-  try {
-    const [rows] = await db.execute(
-      'SELECT id, is_current FROM user_sessions WHERE id = ? AND user_id = ? LIMIT 1',
-      [sessionId, req.user.sub]
-    );
-
-    if (rows.length === 0) {
-      return fail(res, 'Session not found', 404);
-    }
-
-    if (rows[0].is_current) {
-      return fail(res, 'Cannot revoke your current active session', 400);
-    }
-
-    await db.execute(
-      'DELETE FROM user_sessions WHERE id = ? AND user_id = ?',
-      [sessionId, req.user.sub]
-    );
-
-    return ok(res, 'Device signed out successfully');
-  } catch (err) {
-    console.error('[revokeSession]', err);
-    return fail(res, 'Failed to revoke session.', 500);
   }
 }
 
@@ -926,22 +872,6 @@ async function recordLoginEvent(req, res) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function _formatLastActive(date) {
-  if (!date) return 'Unknown';
-  const d = new Date(date);
-  const now = new Date();
-  const diffMs = now - d;
-  const diffMins = Math.floor(diffMs / 60000);
-
-  if (diffMins < 1)  return 'Active now';
-  if (diffMins < 60) return `${diffMins} min ago`;
-  const diffHrs = Math.floor(diffMins / 60);
-  if (diffHrs < 24)  return `${diffHrs} hr ago`;
-  const diffDays = Math.floor(diffHrs / 24);
-  if (diffDays === 1) return 'Yesterday';
-  return `${diffDays} days ago`;
-}
 
 function _formatTimestamp(date) {
   if (!date) return '';
@@ -1316,19 +1246,26 @@ async function updateLoginPin(req, res) {
   }
 }
 
-// ── Forgot Login PIN → recover via email OTP ────────────────────────────────
+// ── Forgot Login PIN → recover via email or SMS OTP ─────────────────────────
 // For a user already authenticated by email/password (has a valid JWT) but
 // locked out of the app because they forgot their Login PIN. Three-step
 // flow, all server-enforced:
-//   1. POST /api/security/pin/login/forgot/send-otp    — email a 6-digit OTP
-//      to the account's registered address (also powers "Resend OTP")
-//   2. POST /api/security/pin/login/forgot/verify-otp  — verify it; success
+//   1. POST /api/security/pin/login/forgot/send-otp    — sends a 6-digit OTP
+//      to the account's registered email (default, also powers
+//      "Resend OTP") or, when { channel: 'sms' } is passed, to the
+//      account's registered mobile number via the existing SMS/OTP
+//      infrastructure (services/smsService.js) — powers "Send OTP via SMS".
+//      Both channels share one OTP + one set of expiry/cooldown/attempt/
+//      lockout rules, so switching channels never grants extra attempts.
+//   2. POST /api/security/pin/login/forgot/verify-otp  — verify it (same
+//      endpoint regardless of which channel it was sent through); success
 //      opens the same login_pin_change_verified_until window used by the
 //      existing Change Login PIN flow
 //   3. POST /api/security/pin/login/change/update       — (existing
 //      endpoint, unchanged) sets the new PIN using that verified window
 // GET /api/security/pin/login/forgot/status lets the app resume the correct
-// UI (locked countdown / resend cooldown) if it's reopened mid-lockout.
+// UI (locked countdown / resend cooldown / which channel is available) if
+// it's reopened mid-lockout.
 
 function _maskEmail(email) {
   const [user, domain] = String(email).split('@');
@@ -1337,11 +1274,24 @@ function _maskEmail(email) {
   return `${visible}${'*'.repeat(Math.max(user.length - visible.length, 1))}@${domain}`;
 }
 
+// Mirrors _maskEmail's style — used to show the SMS option without exposing
+// the full registered mobile number, e.g. "98******10".
+function _maskPhone(phone) {
+  const digits = String(phone || '');
+  if (digits.length < 4) return digits;
+  const start = digits.slice(0, 2);
+  const end = digits.slice(-2);
+  return `${start}${'*'.repeat(Math.max(digits.length - 4, 2))}${end}`;
+}
+
+const FORGOT_PIN_OTP_CHANNELS = ['email', 'sms'];
+
 async function getForgotLoginPinStatus(req, res) {
   await ensureSecurityColumns();
   try {
     const [rows] = await db.execute(
-      `SELECT email, login_pin_reset_locked_until, login_pin_reset_last_sent_at
+      `SELECT email, phone, login_pin_reset_locked_until, login_pin_reset_last_sent_at,
+              login_pin_reset_channel
          FROM users WHERE id = ? LIMIT 1`,
       [req.user.sub]
     );
@@ -1361,6 +1311,12 @@ async function getForgotLoginPinStatus(req, res) {
 
     return ok(res, 'Forgot Login PIN status fetched', {
       email: user.email ? _maskEmail(user.email) : null,
+      // Lets the app offer/hide the "Send OTP via SMS" option and show the
+      // masked number it will go to.
+      phone: user.phone ? _maskPhone(user.phone) : null,
+      sms_available: !!user.phone,
+      // Which channel the currently in-flight OTP (if any) was sent through.
+      last_channel: user.login_pin_reset_channel || 'email',
       locked: !!(lockedUntil && lockedUntil > now),
       locked_remaining_seconds:
         lockedUntil && lockedUntil > now ? Math.ceil((lockedUntil - now) / 1000) : 0,
@@ -1377,9 +1333,16 @@ async function getForgotLoginPinStatus(req, res) {
 
 async function sendForgotLoginPinOtp(req, res) {
   await ensureSecurityColumns();
+
+  // Default stays 'email' so the existing "Resend OTP" button (which does
+  // not send a channel) keeps behaving exactly as before. The new
+  // "Send OTP via SMS" button sends channel: 'sms'.
+  const rawChannel = typeof req.body.channel === 'string' ? req.body.channel.trim().toLowerCase() : 'email';
+  const channel = FORGOT_PIN_OTP_CHANNELS.includes(rawChannel) ? rawChannel : 'email';
+
   try {
     const [rows] = await db.execute(
-      `SELECT id, email, login_pin_reset_locked_until, login_pin_reset_last_sent_at,
+      `SELECT id, email, phone, login_pin_reset_locked_until, login_pin_reset_last_sent_at,
               login_pin_reset_send_count, login_pin_reset_send_window_started_at
          FROM users WHERE id = ? LIMIT 1`,
       [req.user.sub]
@@ -1387,13 +1350,20 @@ async function sendForgotLoginPinOtp(req, res) {
     if (rows.length === 0) return fail(res, 'User not found', 404);
 
     const user = rows[0];
-    if (!user.email) {
+
+    if (channel === 'email' && !user.email) {
       return fail(res, 'No registered email address on this account. Please contact support.', 400);
+    }
+    if (channel === 'sms' && !user.phone) {
+      return fail(res, 'No registered mobile number on this account. Please contact support.', 400);
     }
 
     const now = new Date();
 
     // Still locked out from too many wrong-OTP attempts on a previous code.
+    // This lock (and every rule below) is shared across both channels by
+    // design — switching from email to SMS or back must not reset or
+    // bypass the abuse limits.
     const lockedUntil = user.login_pin_reset_locked_until
       ? new Date(user.login_pin_reset_locked_until)
       : null;
@@ -1405,7 +1375,8 @@ async function sendForgotLoginPinOtp(req, res) {
       });
     }
 
-    // Short cooldown between sends so "Resend OTP" can't be spammed.
+    // Short cooldown between sends so "Resend OTP" / "Send OTP via SMS"
+    // can't be spammed or bounced back and forth between channels.
     const lastSentAt = user.login_pin_reset_last_sent_at
       ? new Date(user.login_pin_reset_last_sent_at)
       : null;
@@ -1420,7 +1391,8 @@ async function sendForgotLoginPinOtp(req, res) {
       }
     }
 
-    // Rolling rate-limit window: cap total sends per window to stop abuse.
+    // Rolling rate-limit window: cap total sends per window to stop abuse,
+    // regardless of how many are via email vs SMS.
     const windowStartedAt = user.login_pin_reset_send_window_started_at
       ? new Date(user.login_pin_reset_send_window_started_at)
       : null;
@@ -1444,6 +1416,21 @@ async function sendForgotLoginPinOtp(req, res) {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + LOGIN_PIN_RESET_OTP_EXPIRY_MS);
 
+    // Send first, persist after a successful send — mirrors the
+    // send-then-commit pattern used by sendMobOtpRegister, so a delivery
+    // failure never leaves a "sent" OTP the user can't actually receive.
+    if (channel === 'sms') {
+      try {
+        await sendOtpSms(user.phone, otp);
+      } catch (smsError) {
+        console.error('[sendForgotLoginPinOtp] SMS delivery failed:', smsError.message);
+        return fail(res, 'Failed to send OTP via SMS. Please try again or use email instead.', 502);
+      }
+    } else {
+      // In production, integrate an email gateway here (e.g. SES, SendGrid, SMTP).
+      console.log(`[forgot-login-pin:send-otp] User ${user.id} <${user.email}> | OTP: ${otp}`);
+    }
+
     await db.execute(
       `UPDATE users
          SET login_pin_reset_otp = ?,
@@ -1452,20 +1439,27 @@ async function sendForgotLoginPinOtp(req, res) {
              login_pin_reset_locked_until = NULL,
              login_pin_reset_last_sent_at = ?,
              login_pin_reset_send_count = ?,
-             login_pin_reset_send_window_started_at = ?
+             login_pin_reset_send_window_started_at = ?,
+             login_pin_reset_channel = ?
          WHERE id = ?`,
-      [otp, expiresAt, now, sendCount + 1, newWindowStartedAt, user.id]
+      [otp, expiresAt, now, sendCount + 1, newWindowStartedAt, channel, user.id]
     );
 
-    // In production, integrate an email gateway here (e.g. SES, SendGrid, SMTP).
-    console.log(`[forgot-login-pin:send-otp] User ${user.id} <${user.email}> | OTP: ${otp}`);
-
-    return ok(res, 'OTP sent to your registered email address', {
-      email: _maskEmail(user.email),
-      expires_in_seconds: Math.ceil(LOGIN_PIN_RESET_OTP_EXPIRY_MS / 1000),
-      // Dev-mode only — remove this field once an email provider is wired up.
-      ...(process.env.NODE_ENV !== 'production' && { otp }),
-    });
+    return ok(
+      res,
+      channel === 'sms'
+        ? 'OTP sent to your registered mobile number'
+        : 'OTP sent to your registered email address',
+      {
+        channel,
+        email: channel === 'email' ? _maskEmail(user.email) : undefined,
+        phone: channel === 'sms' ? _maskPhone(user.phone) : undefined,
+        expires_in_seconds: Math.ceil(LOGIN_PIN_RESET_OTP_EXPIRY_MS / 1000),
+        // Dev-mode only, and only for the email path (SMS actually delivers
+        // via the live provider) — remove once an email provider is wired up.
+        ...(channel === 'email' && process.env.NODE_ENV !== 'production' && { otp }),
+      }
+    );
   } catch (err) {
     console.error('[sendForgotLoginPinOtp]', err);
     return fail(res, 'Failed to send OTP. Please try again.', 500);
@@ -1562,6 +1556,7 @@ async function verifyForgotLoginPinOtp(req, res) {
              login_pin_reset_locked_until = NULL,
              login_pin_reset_send_count = 0,
              login_pin_reset_send_window_started_at = NULL,
+             login_pin_reset_channel = NULL,
              login_pin_change_failed_attempts = 0,
              login_pin_change_locked_until = NULL,
              login_pin_change_verified_until = ?
@@ -1633,9 +1628,7 @@ module.exports = {
   verify2faOtp,
   disable2fa,
   get2faStatus,
-  getSessions,
   registerSession,
-  revokeSession,
   getLoginHistory,
   recordLoginEvent,
   getPinsStatus,

@@ -14,9 +14,7 @@ const {
   verify2faOtp,
   disable2fa,
   get2faStatus,
-  getSessions,
   registerSession,
-  revokeSession,
   getLoginHistory,
   recordLoginEvent,
   getPinsStatus,
@@ -65,14 +63,8 @@ router.post('/2fa/verify-otp', verify2faOtp);
 router.post('/2fa/disable', disable2fa);
 
 // ── Active Sessions ──────────────────────────────────────────────────────────
-// GET    /api/security/sessions
-router.get('/sessions', getSessions);
-
 // POST   /api/security/sessions/register
 router.post('/sessions/register', registerSession);
-
-// DELETE /api/security/sessions/:sessionId
-router.delete('/sessions/:sessionId', revokeSession);
 
 // ── Login History ────────────────────────────────────────────────────────────
 // GET  /api/security/login-history

@@ -30,7 +30,7 @@ const db = require('./config/db');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
 
 // Railway (and most PaaS hosts) put the app behind a reverse proxy, which
 // sets X-Forwarded-For. Express needs to be told to trust exactly one hop
