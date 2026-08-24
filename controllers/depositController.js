@@ -75,6 +75,39 @@ function relPath(f) {
   return f.path.replace(/^.*uploads[/\\]/, '');
 }
 
+// KYC access rule: Deposit requires approved KYC (Plans do not — a user can
+// view/enroll in a plan without KYC; only moving real money in/out of the
+// wallet — Deposit and Withdrawal — is gated). Mirrors the same
+// getLatestKyc()/status==='approved' check withdrawalController.js already
+// enforces for withdrawals, so both money-movement paths use one consistent
+// rule.
+async function getLatestKycStatus(userId) {
+  const [rows] = await db.execute(
+    `SELECT status FROM kyc_submissions
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [userId]
+  );
+  return rows[0]?.status || null;
+}
+
+// ── GET /api/deposit/kyc-status ───────────────────────────────────────────────
+// Lets the Deposit screen check KYC status up front (same shape the
+// withdrawal screen's KycStatus model already expects) so it can show the
+// "Complete KYC" prompt instead of only surfacing the block as a submit-time
+// error.
+async function getDepositKycStatus(req, res) {
+  const userId = req.user.sub;
+  try {
+    const status = await getLatestKycStatus(userId);
+    return ok(res, 'KYC status fetched', { is_verified: status === 'approved' });
+  } catch (err) {
+    console.error('[deposit:kyc-status]', err.message);
+    return fail(res, 'Could not fetch KYC status.', 500);
+  }
+}
+
 // ── POST /api/deposit/upload ──────────────────────────────────────────────────
 // Accepts a single image file, stores it, returns its URL.
 // Flutter DepositRepository calls this first then uses the URL in createDeposit.
@@ -92,6 +125,11 @@ async function uploadScreenshot(req, res) {
 async function createDeposit(req, res) {
   const userId = req.user.sub;
   const { amount, utr_id, proof_image } = req.body;
+
+  const kycStatus = await getLatestKycStatus(userId);
+  if (kycStatus !== 'approved') {
+    return fail(res, 'KYC verification is required to deposit.', 403);
+  }
 
   if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
     return fail(res, 'Invalid amount.', 422);
@@ -392,4 +430,4 @@ async function _notifyDepositReviewed(deposit, newStatus, reason) {
   }
 }
 
-module.exports = { uploadScreenshot, createDeposit, listDeposits, adminListDeposits, getDepositById, adminReviewDeposit };
+module.exports = { uploadScreenshot, createDeposit, listDeposits, adminListDeposits, getDepositById, adminReviewDeposit, getDepositKycStatus };

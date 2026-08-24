@@ -253,6 +253,33 @@ async function _runSchemaMigration() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
 
+    // ── roi_maturity_settlements ─────────────────────────────────────────
+    // One-time investment model: when a plan matures, any ROI that had
+    // accrued but was never manually withdrawn (accrued_roi − withdrawn_roi
+    // at the moment of maturity) is auto-settled to the wallet alongside
+    // the principal — see maturePlanIfDue(). This table is the permanent
+    // record of that one-time settlement — exactly one row per plan, ever
+    // (UNIQUE(plan_id), same pattern as principal_credits) — so it can be
+    // surfaced as its own "ROI Settled" entry in Transaction History
+    // instead of silently folding into withdrawn_roi with no visible trace.
+    // A plan whose user withdrew every last paisa of ROI before maturity
+    // naturally settles ₹0 and gets no row here — see the pendingRoi <= 0
+    // guard in maturePlanIfDue().
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS roi_maturity_settlements (
+        id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+        plan_id     INT UNSIGNED NOT NULL,
+        user_id     INT UNSIGNED NOT NULL,
+        amount      DECIMAL(15,2) NOT NULL,
+        created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq_roi_settlement_plan (plan_id),
+        KEY idx_roi_settlement_user (user_id),
+        CONSTRAINT fk_roi_settlement_plan FOREIGN KEY (plan_id) REFERENCES investment_plans (id) ON DELETE CASCADE,
+        CONSTRAINT fk_roi_settlement_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
     // ── Reconcile legacy ROI withdrawals (self-healing) ────────────────────
     // Each plan may have at most ONE "legacy" row, sized so that:
     //   sum(non-legacy rows) + legacy row = plan.withdrawn_roi (exactly)
@@ -451,7 +478,7 @@ function calendarToUtcMidnight(d) {
   return new Date(Date.UTC(x.getFullYear(), x.getMonth(), x.getDate()));
 }
 
-async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredits, principalCredit) {
+async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredits, principalCredit, roiMaturitySettlement) {
   const loggedWithdrawals = (roiWithdrawals || []).map(w => ({
     id:         String(w.id),
     amount:     Number(w.amount),
@@ -564,6 +591,15 @@ async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredi
     principal_credited_at: principalCredit && principalCredit.created_at
       ? principalCredit.created_at.toISOString()
       : null,
+    // ── Maturity ROI settlement ─────────────────────────────────────────
+    // The one-time "remaining unpaid ROI" credit made alongside the
+    // principal at maturity (see maturePlanIfDue()) — null until the plan
+    // actually matures, and null forever if the user had already withdrawn
+    // every last paisa of ROI before maturity (nothing was left to settle).
+    roi_settled_amount: roiMaturitySettlement ? Number(roiMaturitySettlement.amount) : null,
+    roi_settled_at: roiMaturitySettlement && roiMaturitySettlement.created_at
+      ? roiMaturitySettlement.created_at.toISOString()
+      : null,
   };
 }
 
@@ -617,7 +653,11 @@ async function getMyPlans(req, res) {
         `SELECT * FROM principal_credits WHERE plan_id = ? LIMIT 1`,
         [plan.id]
       );
-      results.push(await buildPlanPayload(plan, ins, roiWds, dailyCredits, principalCredit));
+      const [[roiSettlement]] = await db.execute(
+        `SELECT * FROM roi_maturity_settlements WHERE plan_id = ? LIMIT 1`,
+        [plan.id]
+      );
+      results.push(await buildPlanPayload(plan, ins, roiWds, dailyCredits, principalCredit, roiSettlement));
     }
     return ok(res, 'Plans fetched', results);
   } catch (err) {
@@ -677,27 +717,11 @@ async function enrollPlan(req, res) {
   if (amount < MIN_PLAN_AMOUNT) return fail(res, MIN_AMOUNT_MESSAGE, 422);
   if (amount > MAX_PLAN_AMOUNT) return fail(res, MAX_AMOUNT_MESSAGE, 422);
 
-  // ── KYC gate ─────────────────────────────────────────────────────────────
-  try {
-    const [kycRows] = await db.execute(
-      `SELECT kyc_status FROM users WHERE id = ? LIMIT 1`,
-      [userId]
-    );
-    const kycStatus = kycRows[0]?.kyc_status ?? 'not_submitted';
-    if (kycStatus !== 'approved') {
-      const msg =
-        kycStatus === 'pending'
-          ? 'Your KYC verification is under review. You can invest once it is approved.'
-          : kycStatus === 'rejected'
-          ? 'Your KYC was rejected. Please resubmit your documents before investing.'
-          : 'Please complete your KYC verification before enrolling in a plan.';
-      return fail(res, msg, 403);
-    }
-  } catch (kycErr) {
-    console.error('[plan] KYC gate check failed:', kycErr.message);
-    return fail(res, 'Could not verify KYC status. Please try again.', 500);
-  }
-  // ─────────────────────────────────────────────────────────────────────────
+  // KYC access rule: Plans can be viewed and enrolled in WITHOUT approved
+  // KYC — only Deposit and Withdrawal require it (see depositController.js /
+  // withdrawalController.js). A KYC gate previously blocked enrollment here;
+  // it has been removed per that rule. Enrollment payment itself still goes
+  // through the existing UPI/wallet flow below, unchanged.
 
   const conn = await db.getConnection();
   try {
@@ -995,7 +1019,11 @@ async function adminListPlans(req, res) {
         `SELECT * FROM principal_credits WHERE plan_id = ? LIMIT 1`,
         [plan.id]
       );
-      const payload = await buildPlanPayload(plan, ins, [], [], principalCredit);
+      const [[roiSettlement]] = await db.execute(
+        `SELECT * FROM roi_maturity_settlements WHERE plan_id = ? LIMIT 1`,
+        [plan.id]
+      );
+      const payload = await buildPlanPayload(plan, ins, [], [], principalCredit, roiSettlement);
       // Display-only normalisation — see comment above. The DB row itself
       // (and every other endpoint that reads plan.status) is untouched.
       if (payload.status === 'active') payload.status = 'approved';
@@ -1586,14 +1614,30 @@ async function accrueRoiForPlan(planId) {
   }
 
   const startDate = calendarToUtcMidnight(effectiveStartRaw);
-  // ROI is only earned for the plan's fixed duration — never past maturity,
-  // since the invested amount stops being "at work" once it matures and is
-  // credited back to the wallet.
-  const maturityUtc = plan.maturity_date ? calendarToUtcMidnight(plan.maturity_date) : null;
-  const rawToday = calendarToUtcMidnight(new Date());
-  const today = (maturityUtc && rawToday > maturityUtc) ? maturityUtc : rawToday;
-
   const msPerDay = 24 * 60 * 60 * 1000;
+
+  // ROI is only earned for the plan's fixed duration — never on or past
+  // maturity_date itself. maturity_date is the day the principal (+ any
+  // unpaid ROI) is settled to the wallet by maturePlanIfDue(); it is NOT
+  // an earning day. A 3-day Pre Plan starting on Day 0 must earn ROI for
+  // exactly Day 0, Day 1, Day 2 (3 days) — maturity_date = Day 3 — so the
+  // last earning day is maturity_date − 1 day, not maturity_date.
+  //
+  // ROOT CAUSE (fixed): this used to cap "today" AT maturityUtc (inclusive),
+  // which credited one extra day of ROI on the maturity date itself — e.g.
+  // a 3-day plan was actually paid ROI for 4 days, and any cron run that
+  // happened to land on the maturity date (or later, after a missed run)
+  // would generate a "Daily ROI Credited" entry dated on/after the day the
+  // plan had already matured. This is the "still receiving Daily ROI after
+  // maturity" bug. Capping at (maturityUtc − 1 day) instead makes the cutoff
+  // exactly match the Flutter client's daysElapsedInclusive/totalPlanDays
+  // clamp (see plan_models.dart), which never counts the maturity day as an
+  // earning day either.
+  const maturityUtc = plan.maturity_date ? calendarToUtcMidnight(plan.maturity_date) : null;
+  const lastEarningDayUtc = maturityUtc ? new Date(maturityUtc.getTime() - msPerDay) : null;
+  const rawToday = calendarToUtcMidnight(new Date());
+  const today = (lastEarningDayUtc && rawToday > lastEarningDayUtc) ? lastEarningDayUtc : rawToday;
+
   const totalDays = Math.round((today - startDate) / msPerDay) + 1; // inclusive of today
   if (totalDays <= 0) return 0;
 
@@ -1680,15 +1724,32 @@ async function accrueRoiForPlan(planId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MATURITY — automatic principal release
+//  MATURITY — automatic principal release + unpaid-ROI settlement
 //
 //  One-time investment model: the principal is paid once at enrollment and
 //  stays locked (cannot be withdrawn) for the entire plan duration. The
 //  moment today's date reaches maturity_date, the locked principal is
 //  credited back to the user's wallet automatically — no manual withdrawal
-//  action required. Safe to call repeatedly (cron + login catch-up): once
-//  plan_amount is zeroed and status is 'completed' the guard below makes
-//  every further call a no-op.
+//  action required.
+//
+//  Alongside the principal, any ROI that accrued during the plan's life but
+//  was never manually withdrawn — i.e. (accrued_roi − withdrawn_roi) at the
+//  moment of maturity — is settled to the wallet in the same transaction:
+//    • Never withdrew any ROI  → 100% of accrued_roi is credited.
+//    • Withdrew some ROI       → only the remaining (accrued_roi −
+//                                 withdrawn_roi) is credited; whatever was
+//                                 already withdrawn is never re-credited.
+//    • Withdrew all ROI already → pendingRoi is 0, nothing extra to settle.
+//  Settling means both crediting the wallet AND bumping withdrawn_roi by
+//  the settled amount, so pending ROI reads back as ₹0 from then on and a
+//  second settlement is structurally impossible.
+//
+//  Safe to call repeatedly (cron + login catch-up), and safe even if the
+//  user logs in for the first time long after the plan actually matured:
+//  once plan_amount is zeroed and status is 'completed' the top-level guard
+//  below makes every further call a no-op, and the UNIQUE(plan_id) log
+//  tables are a second layer of protection against double-crediting either
+//  the principal or the settled ROI.
 // ═══════════════════════════════════════════════════════════════════════════════
 async function maturePlanIfDue(planId) {
   const [[plan]] = await db.execute(`SELECT * FROM investment_plans WHERE id = ?`, [planId]);
@@ -1715,22 +1776,47 @@ async function maturePlanIfDue(planId) {
 
     const principal = Number(locked.plan_amount);
 
+    // Remaining unpaid ROI as of this exact moment — whatever the user
+    // already withdrew (via withdrawRoi()) is excluded automatically since
+    // withdrawn_roi already reflects it. Round to paise and floor at 0 to
+    // guard against any float dust ever going negative.
+    const pendingRoi = Math.max(
+      0,
+      Math.round((Number(locked.accrued_roi) - Number(locked.withdrawn_roi)) * 100) / 100
+    );
+
+    const totalCredit = principal + pendingRoi;
+
     await conn.execute(
       `UPDATE users SET balance = balance + ? WHERE id = ?`,
-      [principal, locked.user_id]
+      [totalCredit, locked.user_id]
     );
     await conn.execute(
-      `UPDATE investment_plans SET plan_amount = 0, status = 'completed' WHERE id = ?`,
-      [planId]
+      `UPDATE investment_plans
+          SET plan_amount   = 0,
+              status        = 'completed',
+              withdrawn_roi = withdrawn_roi + ?
+        WHERE id = ?`,
+      [pendingRoi, planId]
     );
-    // Log this credit so it can be surfaced as its own "Principal Credited"
-    // entry in Transaction History / the ROI tab (see buildPlanPayload()).
-    // UNIQUE(plan_id) guarantees exactly one row per plan even if this
-    // function is somehow invoked twice for the same maturity event.
+    // Log the principal credit so it can be surfaced as its own "Principal
+    // Credited" entry in Transaction History / the ROI tab (see
+    // buildPlanPayload()). UNIQUE(plan_id) guarantees exactly one row per
+    // plan even if this function is somehow invoked twice for the same
+    // maturity event.
     await conn.execute(
       `INSERT IGNORE INTO principal_credits (plan_id, user_id, amount) VALUES (?, ?, ?)`,
       [planId, locked.user_id, principal]
     );
+    // Log the settled ROI as its own permanent record too — but only when
+    // there was actually something left unpaid, so a plan the user had
+    // already fully withdrawn ROI from doesn't get a spurious ₹0 row.
+    if (pendingRoi > 0) {
+      await conn.execute(
+        `INSERT IGNORE INTO roi_maturity_settlements (plan_id, user_id, amount) VALUES (?, ?, ?)`,
+        [planId, locked.user_id, pendingRoi]
+      );
+    }
 
     await conn.commit();
 
@@ -1741,8 +1827,17 @@ async function maturePlanIfDue(planId) {
       `Your ${planDisplayName(locked.plan_type)} has matured. The locked principal of ₹${principal.toLocaleString('en-IN')} has been credited to your wallet.`
     ).catch(e => console.error('[plan:maturity] notify error:', e.message));
 
-    console.log(`[maturity] Plan #${planId}: matured, ₹${principal.toFixed(2)} principal credited to wallet.`);
-    return principal;
+    if (pendingRoi > 0) {
+      createNotification(
+        locked.user_id,
+        'roi',
+        'ROI Credited',
+        `Your ${planDisplayName(locked.plan_type)} has matured. The remaining unpaid ROI of ₹${pendingRoi.toLocaleString('en-IN')} has been credited to your wallet.`
+      ).catch(e => console.error('[plan:maturity] roi notify error:', e.message));
+    }
+
+    console.log(`[maturity] Plan #${planId}: matured, ₹${principal.toFixed(2)} principal + ₹${pendingRoi.toFixed(2)} unpaid ROI credited to wallet.`);
+    return totalCredit;
   } catch (err) {
     await conn.rollback();
     console.error(`[maturity] Plan #${planId} auto-credit failed:`, err.message);
