@@ -10,6 +10,7 @@ const { createNotification, createNotificationSilent } = require('./notification
 const { recordLoginAttempt } = require('./loginAnalyticsController');
 const { generateOtp, maskEmail } = require('../utils/otp');
 const { sendOtpEmail } = require('../services/emailService');
+const { sendOtpSms } = require('../services/smsService');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 
@@ -174,6 +175,10 @@ async function _runSecurityColumnsMigration() {
       {
         col: 'login_pin_reset_otp_expires_at',
         sql: `ALTER TABLE users ADD COLUMN login_pin_reset_otp_expires_at TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        col: 'login_pin_reset_channel',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_reset_channel ENUM('EMAIL','PHONE') DEFAULT NULL`,
       },
       {
         // Consecutive incorrect OTP attempts against the current
@@ -1341,7 +1346,7 @@ async function getForgotLoginPinStatus(req, res) {
   await ensureSecurityColumns();
   try {
     const [rows] = await db.execute(
-      `SELECT email, login_pin_reset_locked_until, login_pin_reset_last_sent_at
+      `SELECT email, phone, login_pin_reset_channel, login_pin_reset_locked_until, login_pin_reset_last_sent_at
          FROM users WHERE id = ? LIMIT 1`,
       [req.user.sub]
     );
@@ -1361,6 +1366,8 @@ async function getForgotLoginPinStatus(req, res) {
 
     return ok(res, 'Forgot Login PIN status fetched', {
       email: user.email ? _maskEmail(user.email) : null,
+      phone: user.phone ? `******${String(user.phone).slice(-4)}` : null,
+      channel: user.login_pin_reset_channel || null,
       locked: !!(lockedUntil && lockedUntil > now),
       locked_remaining_seconds:
         lockedUntil && lockedUntil > now ? Math.ceil((lockedUntil - now) / 1000) : 0,
@@ -1379,7 +1386,8 @@ async function sendForgotLoginPinOtp(req, res) {
   await ensureSecurityColumns();
   try {
     const [rows] = await db.execute(
-      `SELECT id, email, login_pin_reset_locked_until, login_pin_reset_last_sent_at,
+      `SELECT id, email, phone, first_name, login_pin_reset_otp, login_pin_reset_channel,
+              login_pin_reset_locked_until, login_pin_reset_last_sent_at,
               login_pin_reset_send_count, login_pin_reset_send_window_started_at
          FROM users WHERE id = ? LIMIT 1`,
       [req.user.sub]
@@ -1387,9 +1395,11 @@ async function sendForgotLoginPinOtp(req, res) {
     if (rows.length === 0) return fail(res, 'User not found', 404);
 
     const user = rows[0];
-    if (!user.email) {
-      return fail(res, 'No registered email address on this account. Please contact support.', 400);
-    }
+    const channel = String(req.body.channel || 'EMAIL').trim().toUpperCase();
+    if (!['EMAIL', 'PHONE'].includes(channel)) return fail(res, 'Channel must be EMAIL or PHONE.', 400);
+    if (channel === 'EMAIL' && !user.email) return fail(res, 'No registered email address on this account. Please contact support.', 400);
+    if (channel === 'PHONE' && !user.phone) return fail(res, 'No registered phone number on this account. Please contact support.', 400);
+    const switchingChannel = !!user.login_pin_reset_otp && user.login_pin_reset_channel !== channel;
 
     const now = new Date();
 
@@ -1409,7 +1419,7 @@ async function sendForgotLoginPinOtp(req, res) {
     const lastSentAt = user.login_pin_reset_last_sent_at
       ? new Date(user.login_pin_reset_last_sent_at)
       : null;
-    if (lastSentAt) {
+    if (lastSentAt && !switchingChannel) {
       const cooldownEndsAt = new Date(lastSentAt.getTime() + LOGIN_PIN_RESET_RESEND_COOLDOWN_MS);
       if (cooldownEndsAt > now) {
         return res.status(429).json({
@@ -1441,30 +1451,51 @@ async function sendForgotLoginPinOtp(req, res) {
       });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    let otp = generateOtp();
+    while (otp === user.login_pin_reset_otp) otp = generateOtp();
     const expiresAt = new Date(Date.now() + LOGIN_PIN_RESET_OTP_EXPIRY_MS);
 
     await db.execute(
       `UPDATE users
          SET login_pin_reset_otp = ?,
              login_pin_reset_otp_expires_at = ?,
+             login_pin_reset_channel = ?,
              login_pin_reset_otp_attempts = 0,
              login_pin_reset_locked_until = NULL,
              login_pin_reset_last_sent_at = ?,
              login_pin_reset_send_count = ?,
              login_pin_reset_send_window_started_at = ?
          WHERE id = ?`,
-      [otp, expiresAt, now, sendCount + 1, newWindowStartedAt, user.id]
+      [otp, expiresAt, channel, now, sendCount + 1, newWindowStartedAt, user.id]
     );
 
-    // In production, integrate an email gateway here (e.g. SES, SendGrid, SMTP).
-    console.log(`[forgot-login-pin:send-otp] User ${user.id} <${user.email}> | OTP: ${otp}`);
+    try {
+      if (channel === 'EMAIL') {
+        await sendOtpEmail({
+          to: user.email, otp,
+          expiryMinutes: Math.ceil(LOGIN_PIN_RESET_OTP_EXPIRY_MS / 60000),
+          userName: user.first_name, purpose: 'pin-reset',
+        });
+      } else {
+        await sendOtpSms(user.phone, otp);
+      }
+    } catch (deliveryError) {
+      await db.execute(
+        `UPDATE users SET login_pin_reset_otp = NULL,
+          login_pin_reset_otp_expires_at = NULL, login_pin_reset_channel = NULL,
+          login_pin_reset_last_sent_at = NULL
+          WHERE id = ?`, [user.id]
+      );
+      console.error(`[forgot-login-pin:send-otp] ${channel.toLowerCase()} delivery failed for user ${user.id}:`, deliveryError.message);
+      return fail(res, `We could not send the verification ${channel === 'EMAIL' ? 'email' : 'SMS'}. Please try again.`, 502);
+    }
 
-    return ok(res, 'OTP sent to your registered email address', {
-      email: _maskEmail(user.email),
+    console.log(`[forgot-login-pin:send-otp] OTP sent via ${channel} for user ${user.id}`);
+
+    return ok(res, `OTP sent to your registered ${channel === 'EMAIL' ? 'email address' : 'phone number'}`, {
+      channel,
+      destination: channel === 'EMAIL' ? _maskEmail(user.email) : `******${String(user.phone).slice(-4)}`,
       expires_in_seconds: Math.ceil(LOGIN_PIN_RESET_OTP_EXPIRY_MS / 1000),
-      // Dev-mode only — remove this field once an email provider is wired up.
-      ...(process.env.NODE_ENV !== 'production' && { otp }),
     });
   } catch (err) {
     console.error('[sendForgotLoginPinOtp]', err);
@@ -1481,7 +1512,7 @@ async function verifyForgotLoginPinOtp(req, res) {
 
   try {
     const [rows] = await db.execute(
-      `SELECT id, login_pin_reset_otp, login_pin_reset_otp_expires_at,
+      `SELECT id, login_pin_reset_otp, login_pin_reset_otp_expires_at, login_pin_reset_channel,
               login_pin_reset_otp_attempts, login_pin_reset_locked_until
          FROM users WHERE id = ? LIMIT 1`,
       [req.user.sub]
@@ -1509,7 +1540,8 @@ async function verifyForgotLoginPinOtp(req, res) {
     if (!user.login_pin_reset_otp_expires_at || now > new Date(user.login_pin_reset_otp_expires_at)) {
       await db.execute(
         `UPDATE users
-           SET login_pin_reset_otp = NULL, login_pin_reset_otp_expires_at = NULL
+           SET login_pin_reset_otp = NULL, login_pin_reset_otp_expires_at = NULL,
+               login_pin_reset_channel = NULL
            WHERE id = ?`,
         [user.id]
       );
@@ -1525,6 +1557,7 @@ async function verifyForgotLoginPinOtp(req, res) {
           `UPDATE users
              SET login_pin_reset_otp = NULL,
                  login_pin_reset_otp_expires_at = NULL,
+                 login_pin_reset_channel = NULL,
                  login_pin_reset_otp_attempts = 0,
                  login_pin_reset_locked_until = ?
              WHERE id = ?`,
@@ -1558,6 +1591,7 @@ async function verifyForgotLoginPinOtp(req, res) {
       `UPDATE users
          SET login_pin_reset_otp = NULL,
              login_pin_reset_otp_expires_at = NULL,
+             login_pin_reset_channel = NULL,
              login_pin_reset_otp_attempts = 0,
              login_pin_reset_locked_until = NULL,
              login_pin_reset_send_count = 0,
@@ -1571,7 +1605,7 @@ async function verifyForgotLoginPinOtp(req, res) {
 
     createNotification(
       user.id, 'system', 'Login PIN Reset Requested',
-      'Your Login PIN reset was verified via email OTP. If this wasn\'t you, please contact support immediately.'
+      `Your Login PIN reset was verified via ${user.login_pin_reset_channel === 'PHONE' ? 'phone' : 'email'} OTP. If this wasn't you, please contact support immediately.`
     ).catch(e => console.error('[verifyForgotLoginPinOtp] notify error:', e.message));
 
     return ok(res, 'OTP verified successfully', {
