@@ -7,6 +7,7 @@ const { ok, fail } = require('../utils/response');
 const { generateOtp } = require('../utils/otp');
 const { sendOtpEmail } = require('../services/emailService');
 const { sendOtpSms } = require('../services/smsService');
+const { resolveRecoveryIdentifier, gmailCanonicalLocal } = require('../utils/recoveryIdentifier');
 
 const OTP_EXPIRY_MINUTES = 5;
 const RESET_SESSION_EXPIRY_MINUTES = 10;
@@ -64,24 +65,6 @@ function generateResetToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-/**
- * Resolves a raw identifier string into the users-table column + normalized
- * value to query against — mirrors the identical logic used in
- * authController.login so both endpoints treat "identifier" identically.
- */
-function resolveIdentifier(identifierRaw) {
-  const id = (identifierRaw || '').trim();
-  const isEmail  = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(id);
-  const isMobile = /^\d{10}$/.test(id);
-
-  if (!isEmail && !isMobile) return null;
-
-  return {
-    column: isEmail ? 'email' : 'phone',
-    value:  isEmail ? id.toLowerCase() : id,
-  };
-}
-
 // ── POST /api/auth/forgot-password/send-otp ──────────────────────────────────
 // Generates a 6-digit OTP for the account matching the given email/mobile,
 // valid for 5 minutes. Any previous OTP(s) issued for that identifier are
@@ -93,29 +76,43 @@ async function sendResetOtp(req, res) {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return fail(res, 'Validation failed', 422, errors.array());
 
-    const resolved = resolveIdentifier(req.body.identifier);
+    const resolved = resolveRecoveryIdentifier(req.body.identifier);
     if (!resolved) return fail(res, 'Enter a valid email or 10-digit mobile number', 400);
     const { column, value } = resolved;
-    const channel = column === 'email' ? 'EMAIL' : 'PHONE';
-    if (req.body.channel && req.body.channel.toUpperCase() !== channel) {
-      return fail(res, `The selected recovery method does not match the ${column} provided.`, 400);
-    }
+    const { channel } = resolved;
 
-    const [users] = await db.execute(
+    let [users] = await db.execute(
       `SELECT id, email, phone, first_name FROM users WHERE ${column} = ? LIMIT 1`,
       [value]
     );
+
+    // A dotted Gmail address and its undotted form are the same mailbox.
+    // Fall back only for Gmail/Googlemail and always continue the recovery
+    // transaction with the registered address returned by the database.
+    const gmailLocal = column === 'email' ? gmailCanonicalLocal(value) : null;
+    if (users.length === 0 && gmailLocal) {
+      [users] = await db.execute(
+        `SELECT id, email, phone, first_name FROM users
+          WHERE LOWER(SUBSTRING_INDEX(email, '@', -1)) IN ('gmail.com', 'googlemail.com')
+            AND LOWER(REPLACE(SUBSTRING_INDEX(email, '@', 1), '.', '')) = ?
+          LIMIT 1`,
+        [gmailLocal]
+      );
+    }
 
     if (users.length === 0) {
       return fail(res, 'No account found with this email or mobile number', 404);
     }
 
     const userId = users[0].id;
+    const recoveryIdentifier = channel === 'EMAIL'
+      ? String(users[0].email).trim().toLowerCase()
+      : String(users[0].phone).trim();
 
     // Invalidate any previous OTP(s) for this identifier (covers resend flow).
     await db.execute(
       'DELETE FROM password_reset_otps WHERE identifier = ?',
-      [value]
+      [recoveryIdentifier]
     );
 
     const otp       = generateOtp();
@@ -124,7 +121,7 @@ async function sendResetOtp(req, res) {
     const [insertResult] = await db.execute(
       `INSERT INTO password_reset_otps (user_id, identifier, channel, otp, expires_at, verified, used)
        VALUES (?, ?, ?, ?, ?, 0, 0)`,
-      [userId, value, channel, otp, expiresAt]
+      [userId, recoveryIdentifier, channel, otp, expiresAt]
     );
 
     try {
@@ -145,7 +142,7 @@ async function sendResetOtp(req, res) {
     console.log(`[sendResetOtp] OTP sent via ${channel} for user ${userId}`);
 
     return ok(res, 'OTP sent successfully', {
-      identifier: value,
+      identifier: recoveryIdentifier,
       channel,
       expires_in_seconds: OTP_EXPIRY_MINUTES * 60,
     });
@@ -166,10 +163,10 @@ async function verifyResetOtp(req, res) {
     await ensurePasswordResetTable();
     const errors = validationResult(req);
     if (!errors.isEmpty()) return fail(res, 'Validation failed', 422, errors.array());
-    const resolved = resolveIdentifier(req.body.identifier);
+    const resolved = resolveRecoveryIdentifier(req.body.identifier);
     if (!resolved) return fail(res, 'Enter a valid email or 10-digit mobile number', 400);
     const { column, value } = resolved;
-    const channel = column === 'email' ? 'EMAIL' : 'PHONE';
+    const { channel } = resolved;
     const otp = req.body.otp.trim();
     const [rows] = await db.execute(
       `SELECT id, otp, expires_at, verified, used, channel
@@ -234,7 +231,7 @@ async function resetPassword(req, res) {
     await ensurePasswordResetTable();
     const errors = validationResult(req);
     if (!errors.isEmpty()) return fail(res, 'Validation failed', 422, errors.array());
-    const resolved = resolveIdentifier(req.body.identifier);
+    const resolved = resolveRecoveryIdentifier(req.body.identifier);
     if (!resolved) return fail(res, 'Enter a valid email or 10-digit mobile number', 400);
     const { value } = resolved;
     const { resetToken, newPassword } = req.body;
