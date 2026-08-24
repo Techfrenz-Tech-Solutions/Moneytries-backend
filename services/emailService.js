@@ -29,9 +29,13 @@ async function sendOtpEmail({ to, otp, expiryMinutes, userName, purpose }) {
   const fromName = process.env.SMTP_FROM_NAME || 'Moneytries';
   const subject = purpose === 'password-reset'
     ? 'Reset your Moneytries password'
-    : 'Your Moneytries verification code';
+    : purpose === 'pin-reset'
+      ? 'Reset your Moneytries login PIN'
+      : 'Your Moneytries verification code';
   const action = purpose === 'password-reset'
     ? 'reset your Moneytries password'
+    : purpose === 'pin-reset'
+      ? 'reset your Moneytries login PIN'
     : purpose === 'two-factor-authentication'
       ? 'complete your Moneytries security verification'
       : 'verify your Moneytries email address';
