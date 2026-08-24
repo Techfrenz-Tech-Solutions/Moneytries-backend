@@ -224,3 +224,24 @@ final response = await _dio.post(
 - Auth endpoints are rate-limited to **10 requests / 15 minutes** per IP.
 - Error messages on login are intentionally generic (no account-enumeration leaks).
 - Never commit your `.env` file — add it to `.gitignore`.
+
+## Account Recovery
+
+Password recovery uses three endpoints under `/api/auth/forgot-password`:
+
+- `POST /send-otp` with `identifier` and `channel` (`EMAIL` or `PHONE`).
+- `POST /verify-otp` with `identifier` and the six-digit `otp`.
+- `POST /reset-password` with `identifier`, `resetToken`, `newPassword`, and
+  `confirmPassword`.
+
+Forgot Login PIN recovery requires an authenticated account session:
+
+- `POST /api/security/pin/login/forgot/send-otp` with `channel`. Omitting the
+  channel defaults to email; switching channels invalidates the prior code.
+- `POST /api/security/pin/login/forgot/verify-otp` with `otp`.
+- `POST /api/security/pin/login/change/update` with matching `new_pin` and
+  `confirm_pin` after successful OTP verification.
+
+Recovery codes are purpose-specific, expire server-side, and are superseded by
+resends or delivery-channel switches. Successful verification issues a separate
+short-lived authorization for the requested password or PIN update.
