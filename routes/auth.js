@@ -114,6 +114,12 @@ const identifierRule = body('identifier')
   .trim()
   .notEmpty().withMessage('Please enter your email or mobile number');
 
+const recoveryChannelRule = body('channel')
+  .optional()
+  .trim()
+  .toUpperCase()
+  .isIn(['EMAIL', 'PHONE']).withMessage('Recovery channel must be EMAIL or PHONE');
+
 const resetOtpRule = body('otp')
   .trim()
   .notEmpty().withMessage('OTP is required')
@@ -178,7 +184,7 @@ router.post(
 router.post(
   '/forgot-password/send-otp',
   forgotPasswordLimiter,
-  [identifierRule],
+  [identifierRule, recoveryChannelRule],
   sendResetOtp
 );
 

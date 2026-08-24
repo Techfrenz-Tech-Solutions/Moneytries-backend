@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS users (
   balance        DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
   vault_balance  DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
 
+  -- Forgot Login PIN recovery. Application migrations add these columns to
+  -- existing installations; keeping them here makes fresh databases complete.
+  login_pin_reset_otp VARCHAR(10) DEFAULT NULL,
+  login_pin_reset_otp_expires_at TIMESTAMP NULL DEFAULT NULL,
+  login_pin_reset_channel ENUM('EMAIL','PHONE') DEFAULT NULL,
+
   -- Profile fields
   profile_image  VARCHAR(512)    DEFAULT NULL,
   date_of_birth  DATE            DEFAULT NULL,
@@ -47,6 +53,26 @@ CREATE TABLE IF NOT EXISTS users (
   UNIQUE KEY uq_member_id (member_id),
   UNIQUE KEY uq_email (email),
   UNIQUE KEY uq_phone (phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ── password recovery OTPs ──────────────────────────────────
+CREATE TABLE IF NOT EXISTS password_reset_otps (
+  id               INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id          INT UNSIGNED NOT NULL,
+  identifier       VARCHAR(191) NOT NULL,
+  channel          ENUM('EMAIL','PHONE') NOT NULL,
+  otp              VARCHAR(6) NOT NULL,
+  reset_token      VARCHAR(64) DEFAULT NULL,
+  reset_expires_at TIMESTAMP NULL DEFAULT NULL,
+  expires_at       TIMESTAMP NOT NULL,
+  verified         TINYINT(1) NOT NULL DEFAULT 0,
+  used             TINYINT(1) NOT NULL DEFAULT 0,
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  PRIMARY KEY (id),
+  KEY idx_pro_identifier (identifier),
+  KEY idx_pro_user (user_id),
+  CONSTRAINT fk_pro_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── member_id_sequence ──────────────────────────────────────
