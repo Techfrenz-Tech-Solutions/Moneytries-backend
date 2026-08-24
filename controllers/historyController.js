@@ -255,6 +255,42 @@ function buildPrincipalCreditEvents(planMap, principalCreditRows) {
   return events;
 }
 
+/**
+ * Turns logged roi_maturity_settlements rows into feed events — at most one
+ * event per plan, ever (UNIQUE(plan_id) on the table — see ensureSchema() /
+ * maturePlanIfDue() in planController.js). This is the one-time investment
+ * model's other terminal event: whatever ROI had accrued but was never
+ * manually withdrawn is auto-settled to the wallet the moment the plan
+ * matures, alongside (but logged separately from) the principal. A plan the
+ * user had already withdrawn every last paisa of ROI from before maturity
+ * settles ₹0 and never gets a row here.
+ */
+function buildRoiMaturitySettlementEvents(planMap, roiSettlementRows) {
+  const events = [];
+  for (const row of roiSettlementRows) {
+    const plan = planMap[row.plan_id];
+    if (!plan) continue;
+    const planLabel  = planTypeLabel(plan.plan_type);
+    const planName   = planTypeShortName(plan.plan_type);
+
+    events.push({
+      id:        `roi_settled_${row.id}`,
+      type:      'roi',
+      subtype:   'roi_maturity_settlement',
+      title:     'ROI Settled',
+      subtitle:  `${planLabel} · Matured — To Wallet`,
+      plan_name: planName,
+      amount:    Number(row.amount),
+      is_credit: true,
+      status:    'approved',
+      plan_id:   String(plan.id),
+      plan_type: plan.plan_type,
+      date:      row.created_at,
+    });
+  }
+  return events;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/history/summary
 //
@@ -537,6 +573,7 @@ async function getRoiHistory(req, res) {
     let dailyCredits = [];
     let roiWithdrawals = [];
     let principalCredits = [];
+    let roiSettlements = [];
 
     if (planIds.length > 0) {
       const placeholders = planIds.map(() => '?').join(',');
@@ -585,6 +622,21 @@ async function getRoiHistory(req, res) {
         pcParams
       );
       principalCredits = pcRows;
+
+      // ── 2d. Maturity ROI settlements for those plans ───────────────────
+      let rsClause = `WHERE plan_id IN (${placeholders})`;
+      const rsParams = [...planIds];
+      if (from) { rsClause += ' AND DATE(created_at) >= ?'; rsParams.push(from); }
+      if (to)   { rsClause += ' AND DATE(created_at) <= ?'; rsParams.push(to);   }
+
+      const [rsRows] = await db.execute(
+        `SELECT id, plan_id, amount, created_at
+           FROM roi_maturity_settlements
+           ${rsClause}
+           ORDER BY created_at DESC`,
+        rsParams
+      );
+      roiSettlements = rsRows;
     }
 
     // ── 3. Build plan lookup map ──────────────────────────────────────────
@@ -612,6 +664,11 @@ async function getRoiHistory(req, res) {
     // plan, ever (see buildPrincipalCreditEvents docblock above).
     events.push(...buildPrincipalCreditEvents(planMap, principalCredits));
 
+    // 4d. Remaining unpaid ROI settled to wallet at maturity — one event per
+    // plan, ever (see buildRoiMaturitySettlementEvents docblock above).
+    const settlementEvents = buildRoiMaturitySettlementEvents(planMap, roiSettlements);
+    events.push(...settlementEvents);
+
     // ── 5. Sort newest first, then paginate ───────────────────────────────
     events.sort((a, b) => new Date(b.date) - new Date(a.date));
     const total     = events.length;
@@ -619,11 +676,15 @@ async function getRoiHistory(req, res) {
 
     // ── 6. ROI summary — computed from the actual withdrawal event list ────
     // total_withdrawn is the sum of every withdrawal event amount (including
-    // the legacy safety-net row if present). This matches exactly what the
-    // transaction list displays, so the card totals are always consistent
-    // with the individual rows shown beneath them.
+    // the legacy safety-net row) PLUS every maturity settlement amount —
+    // both permanently move ROI out of the "pending" pool, since
+    // maturePlanIfDue() bumps withdrawn_roi by the settled amount too. This
+    // matches exactly what the transaction list displays, so the card
+    // totals are always consistent with the individual rows shown beneath
+    // them.
     const totalAccrued     = plans.reduce((s, p) => s + Number(p.accrued_roi  || 0), 0);
-    const totalWithdrawnFromRows = withdrawalEvents.reduce((s, e) => s + e.amount, 0);
+    const totalWithdrawnFromRows = withdrawalEvents.reduce((s, e) => s + e.amount, 0)
+      + settlementEvents.reduce((s, e) => s + e.amount, 0);
     // Also pull from plan column as the authoritative source (roi_withdrawals rows
     // may be filtered by date range, so use plan totals for the summary card).
     const totalWithdrawnFromPlan = plans.reduce((s, p) => s + Number(p.withdrawn_roi || 0), 0);
@@ -865,6 +926,29 @@ async function buildUnifiedHistory(userId, query) {
           );
 
           for (const ev of buildPrincipalCreditEvents(planMap, pcRows)) {
+            if (search && search.trim() && !ev.subtitle.toLowerCase().includes(search.toLowerCase())) continue;
+            allEvents.push(ev);
+          }
+        }
+
+        // Remaining unpaid ROI settled to wallet at maturity — one event
+        // per plan, ever (one-time investment model's other terminal event,
+        // logged separately from the principal credit above).
+        if (!status || status === 'approved') {
+          const rsClause = [`plan_id IN (${ph})`];
+          const rsParams = [...planIds];
+          if (from) { rsClause.push('DATE(created_at) >= ?'); rsParams.push(from); }
+          if (to)   { rsClause.push('DATE(created_at) <= ?'); rsParams.push(to);   }
+
+          const [rsRows] = await db.execute(
+            `SELECT id, plan_id, amount, created_at
+               FROM roi_maturity_settlements
+              WHERE ${rsClause.join(' AND ')}
+              ORDER BY created_at DESC LIMIT 200`,
+            rsParams
+          );
+
+          for (const ev of buildRoiMaturitySettlementEvents(planMap, rsRows)) {
             if (search && search.trim() && !ev.subtitle.toLowerCase().includes(search.toLowerCase())) continue;
             allEvents.push(ev);
           }

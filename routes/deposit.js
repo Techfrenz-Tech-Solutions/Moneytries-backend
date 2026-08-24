@@ -15,6 +15,7 @@ const {
   adminListDeposits,
   getDepositById,
   adminReviewDeposit,
+  getDepositKycStatus,
 } = require('../controllers/depositController');
 
 const router = express.Router();
@@ -93,6 +94,9 @@ const upload = multer({
 });
 
 // ── User routes ───────────────────────────────────────────────────────────────
+
+// GET  /api/deposit/kyc-status  — KYC status, shaped for the deposit screen
+router.get('/kyc-status', authenticate, getDepositKycStatus);
 
 // POST /api/deposit/upload  — upload payment screenshot, get back its URL
 router.post('/upload', authenticate, upload.single('file'), uploadScreenshot);
