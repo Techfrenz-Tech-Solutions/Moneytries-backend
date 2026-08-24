@@ -128,6 +128,19 @@ async function _runSchemaMigration() {
       console.log('[plan] ✅  Added duration_days column.');
     } catch (_) { /* already exists — ignore */ }
 
+    // Safe migration: add funded_by column. Investment plans are now funded
+    // EXCLUSIVELY from the user's wallet balance (see enrollPlan()) — the
+    // old UPI/bank-transfer-proof payment method has been removed entirely.
+    // This flag records which flow a given plan went through, since only
+    // 'wallet' plans actually had their amount deducted from users.balance
+    // at submission time; that is what tells adminRejectPlan() below
+    // whether a rejection needs to refund the wallet. Existing/legacy rows
+    // default to 'bank_transfer' so they are never mistakenly refunded.
+    try {
+      await db.execute(`ALTER TABLE investment_plans ADD COLUMN funded_by ENUM('wallet','bank_transfer') NOT NULL DEFAULT 'bank_transfer'`);
+      console.log('[plan] ✅  Added funded_by column.');
+    } catch (_) { /* already exists — ignore */ }
+
     await db.execute(`
       CREATE TABLE IF NOT EXISTS plan_instalments (
         id           INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -151,6 +164,16 @@ async function _runSchemaMigration() {
         CONSTRAINT chk_instalment_amount_max CHECK (amount <= 100000.00)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    // Safe migration: utr_id / proof_image are no longer collected at
+    // enrollment — plans are now paid exclusively from wallet balance, not
+    // via UPI/bank-transfer proof. Relax the NOT NULL constraint so
+    // wallet-funded rows (which have neither) can be inserted. Existing
+    // bank-transfer-funded rows already have real values and are untouched.
+    try {
+      await db.execute(`ALTER TABLE plan_instalments MODIFY COLUMN utr_id VARCHAR(100) NULL DEFAULT NULL`);
+      console.log('[plan] ✅  Relaxed utr_id to nullable on plan_instalments.');
+    } catch (_) { /* already nullable — ignore */ }
 
     // ── roi_withdrawals ──────────────────────────────────────────────────
     // Logs every "withdraw ROI to wallet" action (instant, no admin review)
@@ -335,6 +358,15 @@ async function _runSchemaMigration() {
       console.error('[plan] auto-split of merged ROI withdrawal failed:', err.message);
     }
 
+    // Safety net: enrollPlan() now reads/writes users.balance (the wallet
+    // balance) to fund plans. That column is normally added by
+    // withdrawalController's own migration, but this guarantees it exists
+    // even if this module happens to initialise first.
+    try {
+      await db.execute(`ALTER TABLE users ADD COLUMN balance DECIMAL(15,2) NOT NULL DEFAULT 0.00`);
+      console.log('[plan] ✅  Added balance column to users table.');
+    } catch (_) { /* already exists — ignore */ }
+
     _schemasReady = true;
     console.log('[plan] ✅  investment_plans, plan_instalments, roi_withdrawals & roi_daily_credits tables ready.');
   } catch (err) {
@@ -464,6 +496,10 @@ async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredi
       ? (plan.duration_days != null ? Number(plan.duration_days) : null)
       : null,
     monthly_amount:    Number(plan.monthly_amount),
+    // How this plan was paid for. 'wallet' for every plan enrolled through
+    // the current flow; 'bank_transfer' only appears on legacy plans that
+    // predate the wallet-only enrollment change.
+    funded_by:         plan.funded_by || 'bank_transfer',
     months_paid:       plan.months_paid,
     // The exact moment the user submitted this plan/payment request (set
     // once at INSERT time in enrollPlan and never touched again) — distinct
@@ -608,20 +644,19 @@ async function getPlanAmount(req, res) {
 }
 
 // ── POST /api/plans/enroll ────────────────────────────────────────────────────
+// Investment plans are now funded EXCLUSIVELY from the user's wallet
+// balance. The old UPI/bank-transfer + payment-screenshot + UTR flow has
+// been permanently removed — there is no other way to start a plan.
+//
+//   submit  → users.balance -= amount  (locked immediately, plan status =
+//                                        'under_review', same as before)
+//   approve → balance unchanged (already deducted; the plan is now funded)
+//   reject  → users.balance += amount  (locked amount is refunded — see
+//                                        adminRejectPlan below)
 async function enrollPlan(req, res) {
   await ensureSchema();
   const userId = req.user.sub;
-  const { plan_type: rawType, monthly_amount, utr_id, proof_image, payment_method } = req.body;
-
-  // ── Hard block: Wallet Balance must never be used to create/pay for an
-  // investment plan. Plans may only be started via the UPI/bank-transfer
-  // proof + admin-approval flow below. This check is intentionally kept
-  // even though no wallet-funded route currently calls this controller, so
-  // that reintroducing such a route (or any client sending this flag)
-  // cannot silently bypass the restriction.
-  if (typeof payment_method === 'string' && payment_method.trim().toLowerCase() === 'wallet') {
-    return fail(res, 'Wallet Balance cannot be used to start an investment plan. Please pay via UPI/bank transfer.', 403);
-  }
+  const { plan_type: rawType, monthly_amount } = req.body;
 
   const planType = normalisePlanType(rawType);
   if (!planType) return fail(res, 'Invalid plan_type. Use pre_plan, 3, 6, or 12.', 422);
@@ -641,7 +676,6 @@ async function enrollPlan(req, res) {
   if (!amount || amount <= 0) return fail(res, 'Invalid monthly_amount.', 422);
   if (amount < MIN_PLAN_AMOUNT) return fail(res, MIN_AMOUNT_MESSAGE, 422);
   if (amount > MAX_PLAN_AMOUNT) return fail(res, MAX_AMOUNT_MESSAGE, 422);
-  if (!utr_id || utr_id.trim().length < 6) return fail(res, 'Invalid UTR ID.', 422);
 
   // ── KYC gate ─────────────────────────────────────────────────────────────
   try {
@@ -681,6 +715,32 @@ async function enrollPlan(req, res) {
       return fail(res, 'You already have an active or pending plan of this type.', 409);
     }
 
+    // ── Wallet balance check + lock ─────────────────────────────────────────
+    // Row-lock the user so two simultaneous enroll/withdraw/spend requests
+    // can never both succeed against the same money, then check the
+    // up-to-the-millisecond balance against the investment amount. If it's
+    // insufficient, stop before anything is written. If it's sufficient,
+    // deduct/lock the amount from the wallet right now (not at admin-approval
+    // time) — the exact same "lock on submit" pattern already used by
+    // walletWithdrawRequest() in withdrawalController.js.
+    const [[userRow]] = await conn.execute(
+      `SELECT COALESCE(balance, 0) AS balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE`,
+      [userId]
+    );
+    if (!userRow) {
+      await conn.rollback();
+      return fail(res, 'User not found.', 404);
+    }
+    const walletBalance = Number(userRow.balance) || 0;
+    if (walletBalance < amount) {
+      await conn.rollback();
+      return fail(res, 'Insufficient wallet balance', 422);
+    }
+    await conn.execute(
+      `UPDATE users SET balance = balance - ? WHERE id = ?`,
+      [amount, userId]
+    );
+
     // Detect whether this is the user's very first plan of ANY type/status —
     // used below to notify their referrer only once, the moment a referred
     // user starts their first plan (separate from the bonus notification,
@@ -692,16 +752,16 @@ async function enrollPlan(req, res) {
     const isFirstEverPlan = priorPlanCount === 0;
 
     const [insertRes] = await conn.execute(
-      `INSERT INTO investment_plans (user_id, plan_type, monthly_amount, months_paid, duration_days, status)
-       VALUES (?, ?, ?, 0, ?, 'under_review')`,
+      `INSERT INTO investment_plans (user_id, plan_type, monthly_amount, months_paid, duration_days, status, funded_by)
+       VALUES (?, ?, ?, 0, ?, 'under_review', 'wallet')`,
       [userId, planType, amount, durationDays]
     );
     const planId = insertRes.insertId;
 
     await conn.execute(
       `INSERT INTO plan_instalments (plan_id, user_id, month_number, amount, utr_id, proof_image, status)
-       VALUES (?, ?, 1, ?, ?, ?, 'pending')`,
-      [planId, userId, amount, utr_id.trim(), proof_image || null]
+       VALUES (?, ?, 1, ?, NULL, NULL, 'pending')`,
+      [planId, userId, amount]
     );
 
     await conn.commit();
@@ -710,7 +770,7 @@ async function enrollPlan(req, res) {
       userId,
       'plan',
       'Investment Plan Submitted',
-      `Your ${planDisplayName(planType)} enrollment (one-time payment of ₹${amount.toLocaleString('en-IN')}) has been submitted and is under review by admin.`
+      `Your ${planDisplayName(planType)} enrollment (one-time payment of ₹${amount.toLocaleString('en-IN')}) has been paid from your wallet balance and is under review by admin.`
     ).catch(e => console.error('[plan:enroll] notify error:', e.message));
 
     if (isFirstEverPlan) {
@@ -1096,13 +1156,28 @@ async function adminRejectPlan(req, res) {
       [planId]
     );
 
+    // Refund the locked investment amount back to the user's wallet — only
+    // for plans funded via wallet balance (funded_by = 'wallet'), since
+    // that is the only case where enrollPlan() actually deducted
+    // users.balance at submission time. Legacy UPI/bank-transfer-funded
+    // plans never touched the wallet, so no refund is due for those.
+    const isWalletFunded = plan.funded_by === 'wallet';
+    if (isWalletFunded) {
+      await conn.execute(
+        `UPDATE users SET balance = balance + ? WHERE id = ?`,
+        [plan.monthly_amount, plan.user_id]
+      );
+    }
+
     await conn.commit();
 
     createNotification(
       plan.user_id,
       'plan',
       'Investment Plan Rejected',
-      `Your ${plan.plan_type.replace('_', '-')} investment plan was rejected.${reason ? ` Reason: ${reason}` : ''}`
+      isWalletFunded
+        ? `Your ${plan.plan_type.replace('_', '-')} investment plan was rejected.${reason ? ` Reason: ${reason}` : ''} ₹${Number(plan.monthly_amount).toLocaleString('en-IN')} has been refunded to your wallet balance.`
+        : `Your ${plan.plan_type.replace('_', '-')} investment plan was rejected.${reason ? ` Reason: ${reason}` : ''}`
     ).catch(e => console.error('[plan:reject] notify error:', e.message));
 
     return ok(res, 'Plan rejected.');
