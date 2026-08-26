@@ -431,6 +431,15 @@ async function getKycStatus(req, res) {
   const userId = req.user.sub;
 
   try {
+    // Authoritative account-level approval flag — the field admin approval
+    // actually sets (see reviewKyc below). Fetched fresh on every call so
+    // an admin approval is reflected the moment a screen re-checks status.
+    const [userRows] = await db.execute(
+      `SELECT kyc_status FROM users WHERE id = ? LIMIT 1`,
+      [userId]
+    );
+    const accountStatus = userRows[0]?.kyc_status || 'not_submitted';
+
     const [rows] = await db.execute(
       `SELECT
          id, status, rejection_reason,
@@ -450,13 +459,20 @@ async function getKycStatus(req, res) {
     );
 
     if (rows.length === 0) {
-      return ok(res, 'No KYC submission found', { status: 'not_submitted' });
+      return ok(res, 'No KYC submission found', { status: accountStatus });
     }
 
     const kyc = rows[0];
 
     const data = {
       ...kyc,
+      // Override the submission row's own status with the authoritative
+      // users.kyc_status flag — kept in sync with this row by reviewKyc,
+      // but treated as the single source of truth here so every screen
+      // (Deposit, Withdrawal, Plan → Add Money, this KYC screen) agrees on
+      // whether the account is actually approved, even if the two values
+      // were ever to drift apart.
+      status: accountStatus,
       aadhaar_front_url:        fileUrl(kyc.aadhaar_front_path,        req),
       aadhaar_back_url:         fileUrl(kyc.aadhaar_back_path,         req),
       pan_front_url:            fileUrl(kyc.pan_front_path,            req),
