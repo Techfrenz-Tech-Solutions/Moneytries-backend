@@ -66,13 +66,24 @@ function inr(amount) {
   return Number(amount).toLocaleString('en-IN');
 }
 
-/** Fetch the latest approved/pending KYC row (with bank details) for a user. */
+/**
+ * Fetch the KYC approval flag + latest bank details for a user.
+ *
+ * `status` comes from `users.kyc_status` — the single authoritative
+ * account-level field admin approval sets (see kycController.reviewKyc) —
+ * not from re-deriving it off the latest kyc_submissions row, which could
+ * go stale relative to the account flag. Bank details still come from the
+ * latest kyc_submissions row since that's where they're stored. Always
+ * queried fresh (no caching) so an admin approval is reflected immediately.
+ */
 async function getLatestKyc(userId) {
   const [rows] = await db.execute(
-    `SELECT status, account_holder_name, account_number, ifsc_code, bank_name
-       FROM kyc_submissions
-      WHERE user_id = ?
-      ORDER BY created_at DESC
+    `SELECT u.kyc_status AS status,
+            k.account_holder_name, k.account_number, k.ifsc_code, k.bank_name
+       FROM users u
+       LEFT JOIN kyc_submissions k ON k.user_id = u.id
+      WHERE u.id = ?
+      ORDER BY k.created_at DESC
       LIMIT 1`,
     [userId]
   );

@@ -81,15 +81,20 @@ function relPath(f) {
 // getLatestKyc()/status==='approved' check withdrawalController.js already
 // enforces for withdrawals, so both money-movement paths use one consistent
 // rule.
+//
+// Source of truth: `users.kyc_status` — the single authoritative
+// account-level flag that admin approval sets (see kycController.reviewKyc).
+// This used to re-derive status from the latest kyc_submissions row instead,
+// which could go stale relative to the account flag and leave Deposit
+// showing "KYC required" even after an admin had approved the account.
+// Always queried fresh (no caching) so an admin approval is reflected the
+// moment the Deposit page is opened.
 async function getLatestKycStatus(userId) {
   const [rows] = await db.execute(
-    `SELECT status FROM kyc_submissions
-      WHERE user_id = ?
-      ORDER BY created_at DESC
-      LIMIT 1`,
+    `SELECT kyc_status FROM users WHERE id = ? LIMIT 1`,
     [userId]
   );
-  return rows[0]?.status || null;
+  return rows[0]?.kyc_status || 'not_submitted';
 }
 
 // ── GET /api/deposit/kyc-status ───────────────────────────────────────────────
