@@ -75,20 +75,14 @@ function relPath(f) {
   return f.path.replace(/^.*uploads[/\\]/, '');
 }
 
-// KYC access rule: Deposit requires approved KYC (Plans do not — a user can
-// view/enroll in a plan without KYC; only moving real money in/out of the
-// wallet — Deposit and Withdrawal — is gated). Mirrors the same
-// getLatestKyc()/status==='approved' check withdrawalController.js already
-// enforces for withdrawals, so both money-movement paths use one consistent
-// rule.
+// KYC access rule: Withdrawal requires approved KYC — Deposit and Plans do
+// not (a user can deposit or view/enroll in a plan without KYC; only
+// moving money OUT of the wallet via Withdrawal is gated). See
+// withdrawalController.js for the equivalent status()==='approved' check
+// enforced there.
 //
 // Source of truth: `users.kyc_status` — the single authoritative
 // account-level flag that admin approval sets (see kycController.reviewKyc).
-// This used to re-derive status from the latest kyc_submissions row instead,
-// which could go stale relative to the account flag and leave Deposit
-// showing "KYC required" even after an admin had approved the account.
-// Always queried fresh (no caching) so an admin approval is reflected the
-// moment the Deposit page is opened.
 async function getLatestKycStatus(userId) {
   const [rows] = await db.execute(
     `SELECT kyc_status FROM users WHERE id = ? LIMIT 1`,
@@ -98,10 +92,10 @@ async function getLatestKycStatus(userId) {
 }
 
 // ── GET /api/deposit/kyc-status ───────────────────────────────────────────────
-// Lets the Deposit screen check KYC status up front (same shape the
-// withdrawal screen's KycStatus model already expects) so it can show the
-// "Complete KYC" prompt instead of only surfacing the block as a submit-time
-// error.
+// Informational only — Deposit no longer requires approved KYC to submit,
+// but the account's KYC status is still exposed here in case the Deposit
+// screen wants to surface it (e.g. a non-blocking "complete KYC" nudge)
+// without gating submission on it.
 async function getDepositKycStatus(req, res) {
   const userId = req.user.sub;
   try {
@@ -130,11 +124,6 @@ async function uploadScreenshot(req, res) {
 async function createDeposit(req, res) {
   const userId = req.user.sub;
   const { amount, utr_id, proof_image } = req.body;
-
-  const kycStatus = await getLatestKycStatus(userId);
-  if (kycStatus !== 'approved') {
-    return fail(res, 'KYC verification is required to deposit.', 403);
-  }
 
   if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
     return fail(res, 'Invalid amount.', 422);
