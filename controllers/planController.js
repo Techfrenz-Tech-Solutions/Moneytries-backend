@@ -18,12 +18,11 @@ const PLAN_MONTHS = {
   '12_month': 12,
 };
 
-// Pre Plan has no fixed month count — the user chooses a duration in days
-// (3–80) at enrollment, stored per-plan in investment_plans.duration_days.
-// This fallback is only used if that column is somehow missing/null.
-const PRE_PLAN_DEFAULT_DAYS = 30;
-const PRE_PLAN_MIN_DAYS = 3;
-const PRE_PLAN_MAX_DAYS = 80;
+// Pre Plan has no fixed month count — its duration is chosen by the user
+// (a +/- day selector bounded between a minimum and maximum), stored
+// per-plan in investment_plans.duration_days like before.
+const PRE_PLAN_MIN_DAYS = 1;
+const PRE_PLAN_MAX_DAYS = 100;
 
 // ── Business rule: min / max single-transaction investment amount ─────────────
 // No single investment plan's one-time invested amount may be below ₹500 or
@@ -117,7 +116,7 @@ async function _runSchemaMigration() {
 
     // Safe migration: extend plan_type enum with 'pre_plan' for pre-existing
     // installs (a brand-new CREATE TABLE above already includes it). Also add
-    // duration_days, which only Pre Plan uses (3–80 user-chosen days) since
+    // duration_days, which only Pre Plan uses (user-selected days) since
     // every other plan type has a fixed month-based duration.
     try {
       await db.execute(`ALTER TABLE investment_plans MODIFY COLUMN plan_type ENUM('pre_plan','3_month','6_month','12_month') NOT NULL`);
@@ -432,7 +431,7 @@ function addMonthsToDateStr(ymd, n) {
 // Adds `n` calendar days to a 'YYYY-MM-DD' string and returns a new
 // 'YYYY-MM-DD' string. Pure UTC-midnight math — same timezone-safety
 // rationale as addMonthsToDateStr() above. Used for Pre Plan, whose
-// duration is a plain day count (3–80) rather than calendar months.
+// duration is a fixed day count (1 day) rather than calendar months.
 function addDaysToDateStr(ymd, days) {
   const [y, m, d] = ymd.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d) + days * 24 * 60 * 60 * 1000);
@@ -446,7 +445,7 @@ function addDaysToDateStr(ymd, days) {
 function computeMaturityDateStr(startDateStr, planType, durationDays) {
   if (planType === 'pre_plan') {
     const days = Number(durationDays);
-    const safeDays = Number.isFinite(days) && days > 0 ? days : PRE_PLAN_DEFAULT_DAYS;
+    const safeDays = Number.isFinite(days) && days > 0 ? days : PRE_PLAN_MIN_DAYS;
     return addDaysToDateStr(startDateStr, safeDays);
   }
   return addMonthsToDateStr(startDateStr, PLAN_MONTHS[planType] || 6);
@@ -516,8 +515,8 @@ async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredi
   return {
     id:                String(plan.id),
     plan_type:         plan.plan_type === 'pre_plan' ? 'pre_plan' : (PLAN_MONTHS[plan.plan_type] || 6),
-    // Only meaningful (non-null) for Pre Plan — the user-chosen 3–80 day
-    // duration. Every other plan type has a fixed, month-derived duration
+    // Only meaningful (non-null) for Pre Plan — its user-selected duration
+    // in days. Every other plan type has a fixed, month-derived duration
     // the client already knows from `plan_type`.
     duration_days:     plan.plan_type === 'pre_plan'
       ? (plan.duration_days != null ? Number(plan.duration_days) : null)
@@ -701,15 +700,17 @@ async function enrollPlan(req, res) {
   const planType = normalisePlanType(rawType);
   if (!planType) return fail(res, 'Invalid plan_type. Use pre_plan, 3, 6, or 12.', 422);
 
-  // Pre Plan has no fixed duration — the user must supply how many days
-  // (3–80) to run it for. Every other plan type ignores duration_days
-  // entirely (their duration is fixed by plan_type).
+  // Pre Plan's duration is chosen by the user on the comparison screen (a
+  // +/- day selector bounded between PRE_PLAN_MIN_DAYS and
+  // PRE_PLAN_MAX_DAYS) and sent through as duration_days. Every other plan
+  // type ignores duration_days entirely (their duration is fixed by
+  // plan_type). Any out-of-range or malformed value is clamped rather than
+  // rejected, since it can only originate from the app's own selector.
   let durationDays = null;
   if (planType === 'pre_plan') {
-    durationDays = Number(req.body.duration_days);
-    if (!Number.isInteger(durationDays) || durationDays < PRE_PLAN_MIN_DAYS || durationDays > PRE_PLAN_MAX_DAYS) {
-      return fail(res, `Invalid duration_days for Pre Plan. Must be a whole number between ${PRE_PLAN_MIN_DAYS} and ${PRE_PLAN_MAX_DAYS}.`, 422);
-    }
+    const requested = Number(req.body.duration_days);
+    const valid = Number.isInteger(requested) ? requested : PRE_PLAN_MIN_DAYS;
+    durationDays = Math.min(Math.max(valid, PRE_PLAN_MIN_DAYS), PRE_PLAN_MAX_DAYS);
   }
 
   const amount = Number(monthly_amount);
